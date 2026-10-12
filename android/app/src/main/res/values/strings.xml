@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Smart Shield</string>
+    <string name="title_activity_main">Smart Shield</string>
+    <string name="package_name">com.smartshield.app</string>
+    <string name="custom_url_scheme">com.smartshield.app</string>
+</resources>
