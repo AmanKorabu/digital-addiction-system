@@ -75,6 +75,21 @@ export const getTodayUsage = async () => {
 
         const result =
             await UsageStats.getTodayUsage();
+        console.log(
+            "SMART SHIELD RAW USAGE:",
+            JSON.stringify(result, null, 2)
+        );
+
+        console.table(
+            (result.apps || []).map((app) => ({
+                appName: app.appName,
+                packageName: app.packageName,
+                usageMinutes: Math.round(
+                    app.totalTimeInForeground / 60000
+                ),
+                usageMilliseconds: app.totalTimeInForeground,
+            }))
+        );
 
         return {
             success: true,

@@ -15,6 +15,7 @@ import { db } from "../config/firebase";
 /**
  * Register or update a device for a user
  */
+
 export const registerDevice = async (deviceData) => {
   try {
     const {
@@ -27,13 +28,15 @@ export const registerDevice = async (deviceData) => {
       androidVersion = "Unknown",
     } = deviceData;
 
-    if (!deviceId) {
-      throw new Error("Device ID is required.");
+    if (!deviceId || !userId) {
+      throw new Error("Device ID and User ID are required.");
     }
 
-    if (!userId) {
-      throw new Error("User ID is required.");
-    }
+    console.log("Registering Smart Shield device:", {
+      deviceId,
+      userId,
+      deviceName,
+    });
 
     const deviceRef = doc(db, "devices", deviceId);
 
@@ -47,29 +50,62 @@ export const registerDevice = async (deviceData) => {
         model,
         manufacturer,
         androidVersion,
-        status: "connected",
-        lastActive: serverTimestamp(),
+        status: "disconnected",
         updatedAt: serverTimestamp(),
       },
-      {
-        merge: true,
-      }
+      { merge: true }
     );
 
-    // Keep the user's deviceId linked to the device
+    console.log("Device document saved:", deviceId);
+
     const userRef = doc(db, "users", userId);
 
-    await updateDoc(userRef, {
-      deviceId,
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      userRef,
+      {
+        deviceId,
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log("User linked to device:", userId);
 
     return {
       success: true,
       deviceId,
     };
   } catch (error) {
-    console.error("Register Device Error:", error);
+    console.error("Register Device Error:", error.code, error.message);
+
+    return {
+      success: false,
+      error: error.message,
+      code: error.code || "unknown",
+    };
+  }
+};
+
+/**
+ * Send a heartbeat while the app is active.
+ */
+export const sendDeviceHeartbeat = async (deviceId) => {
+  try {
+    if (!deviceId) {
+      throw new Error("Device ID is required.");
+    }
+
+    const deviceRef = doc(db, "devices", deviceId);
+
+    await updateDoc(deviceRef, {
+      lastSeen: serverTimestamp(),
+      status: "connected",
+      updatedAt: serverTimestamp(),
+    });
+
+    return { success: true };
+  } catch (error) {
+    console.error("Heartbeat Error:", error.code, error.message);
 
     return {
       success: false,
@@ -77,6 +113,7 @@ export const registerDevice = async (deviceData) => {
     };
   }
 };
+
 
 /**
  * Get a device by its device ID
