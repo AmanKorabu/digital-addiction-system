@@ -17,26 +17,35 @@ import {
 import { Button, message, Spin, Switch, Modal } from "antd";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { onAuthStateChanged } from "firebase/auth";
+import { Network } from "@capacitor/network";
 
 import BottomNavigation from "../../components/user/BottomNavigation";
 import { logoutUser } from "../../services/authService";
 import { auth, db } from "../../config/firebase";
+
 import {
   hasUsageAccess,
   openUsageAccessSettings,
 } from "../../services/usageStatsService";
+
 import {
   hasOverlayPermission,
   openOverlaySettings,
+  hasAccessibilityPermission,
+  openAccessibilitySettings,
 } from "../../services/focusModeService";
+
 import {
-  ONLINE_WINDOW_MS,
   ensureDeviceRegistered,
   markDeviceOffline,
   subscribeToDevice,
   syncDeviceStatus,
   toMillis,
 } from "../../services/deviceControlService";
+
+import {
+  subscribeToDevicePresence,
+} from "../../services/devicePresenceService";
 
 // --------------------------------------------------
 // HELPERS
@@ -49,11 +58,9 @@ const DEFAULT_NOTIFICATIONS = {
   important: true,
 };
 
-// The label the parent gave the device (for example "Aarav's phone").
 const getDeviceTitle = (device) =>
   (device?.deviceName || "").trim() || "Android device";
 
-// What the phone itself reports (for example "OPPO CPH2251").
 const getDeviceSubtitle = (device) => {
   const manufacturer = (device?.manufacturer || "").trim();
   const model = (device?.model || "").trim();
@@ -73,7 +80,10 @@ const getDeviceSubtitle = (device) => {
 const formatLastSeen = (timestamp, now) => {
   if (!timestamp) return "Never";
 
-  const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+  const seconds = Math.max(
+    0,
+    Math.floor((now - timestamp) / 1000)
+  );
 
   if (seconds < 60) return "Just now";
 
@@ -91,7 +101,18 @@ const formatLastSeen = (timestamp, now) => {
   });
 };
 
-const PermissionRow = ({ icon, tone, title, description, granted, onAllow }) => (
+// --------------------------------------------------
+// PERMISSION ROW
+// --------------------------------------------------
+
+const PermissionRow = ({
+  icon,
+  tone,
+  title,
+  description,
+  granted,
+  onAllow,
+}) => (
   <div className="flex items-center gap-3 rounded-xl border border-slate-200 p-4">
     <div
       className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${tone}`}
@@ -100,8 +121,13 @@ const PermissionRow = ({ icon, tone, title, description, granted, onAllow }) => 
     </div>
 
     <div className="min-w-0 flex-1">
-      <p className="text-sm font-semibold text-slate-900">{title}</p>
-      <p className="mt-1 text-xs text-slate-500">{description}</p>
+      <p className="text-sm font-semibold text-slate-900">
+        {title}
+      </p>
+
+      <p className="mt-1 text-xs text-slate-500">
+        {description}
+      </p>
     </div>
 
     {granted ? (
@@ -120,6 +146,10 @@ const PermissionRow = ({ icon, tone, title, description, granted, onAllow }) => 
   </div>
 );
 
+// --------------------------------------------------
+// NOTIFICATION ROW
+// --------------------------------------------------
+
 const NotificationRow = ({
   icon,
   tone,
@@ -137,8 +167,13 @@ const NotificationRow = ({
     </div>
 
     <div className="min-w-0 flex-1">
-      <p className="text-sm font-semibold text-slate-900">{title}</p>
-      <p className="mt-1 text-xs text-slate-500">{description}</p>
+      <p className="text-sm font-semibold text-slate-900">
+        {title}
+      </p>
+
+      <p className="mt-1 text-xs text-slate-500">
+        {description}
+      </p>
     </div>
 
     <Switch
@@ -161,171 +196,361 @@ const UserProfileDashboard = () => {
   const [loading, setLoading] = useState(true);
   const [currentUserId, setCurrentUserId] = useState(null);
 
-  // Device (live from Firestore)
+  // DEVICE STATE
+
   const [deviceId, setDeviceId] = useState(null);
   const [deviceData, setDeviceData] = useState(null);
   const [deviceLoading, setDeviceLoading] = useState(true);
   const [deviceError, setDeviceError] = useState("");
 
-  // Real Android permission state
+  const [networkConnected, setNetworkConnected] = useState(false);
+  const [presenceConnected, setPresenceConnected] = useState(false);
+  const [presenceReady, setPresenceReady] = useState(false);
+
+  const unsubscribeDeviceRef = useRef(null);
+  const unsubscribePresenceRef = useRef(null);
+  const deviceRequestRef = useRef(0);
+
+  // NETWORK LISTENER
+
+  useEffect(() => {
+    let listener;
+    let mounted = true;
+
+    const setupNetworkListener = async () => {
+      try {
+        const status = await Network.getStatus();
+
+        if (mounted) {
+          setNetworkConnected(Boolean(status.connected));
+        }
+
+        listener = await Network.addListener(
+          "networkStatusChange",
+          (status) => {
+            if (mounted) {
+              setNetworkConnected(Boolean(status.connected));
+            }
+          }
+        );
+      } catch (error) {
+        console.error("Network listener error:", error);
+
+        if (mounted) {
+          setNetworkConnected(false);
+        }
+      }
+    };
+
+    setupNetworkListener();
+
+    return () => {
+      mounted = false;
+      listener?.remove();
+    };
+  }, []);
+
+  // PERMISSIONS
+
   const [permissions, setPermissions] = useState({
     checked: false,
     usage: false,
     overlay: false,
+    accessibility: false,
+    accessibilityConnected: false,
   });
 
-  // Ticks so "online / last seen" stays fresh
+  // LIVE CLOCK
+
   const [clock, setClock] = useState(Date.now());
 
-  // Modals
+  // MODALS
+
   const [securityModalOpen, setSecurityModalOpen] = useState(false);
   const [notificationModalOpen, setNotificationModalOpen] = useState(false);
 
-  // Notification preferences (saved per user in Firestore)
+  // NOTIFICATION PREFERENCES
+
   const [notificationSettings, setNotificationSettings] =
     useState(DEFAULT_NOTIFICATIONS);
+
   const [savingKey, setSavingKey] = useState(null);
 
-  const unsubscribeDeviceRef = useRef(null);
-
-  // --------------------------------------------------
-  // PERMISSIONS (real status, not hard-coded)
-  // --------------------------------------------------
+  // PERMISSION CHECK
 
   const checkPermissions = useCallback(async () => {
-    const [usage, overlay] = await Promise.all([
-      hasUsageAccess(),
-      hasOverlayPermission(),
-    ]);
+    try {
+      const [usage, overlay, accessibility] = await Promise.all([
+        hasUsageAccess(),
+        hasOverlayPermission(),
+        hasAccessibilityPermission(),
+      ]);
 
-    setPermissions({
-      checked: true,
-      usage: Boolean(usage.success && usage.hasAccess),
-      overlay: Boolean(overlay.success && overlay.granted),
-    });
+      setPermissions({
+        checked: true,
+        usage: Boolean(usage.success && usage.hasAccess),
+        overlay: Boolean(overlay.success && overlay.granted),
+        accessibility: Boolean(
+          accessibility.success && accessibility.granted
+        ),
+        accessibilityConnected: Boolean(
+          accessibility.success && accessibility.connected
+        ),
+      });
+    } catch (error) {
+      console.error("Permission check failed:", error);
+
+      setPermissions((previous) => ({
+        ...previous,
+        checked: true,
+      }));
+    }
   }, []);
 
-  // --------------------------------------------------
-  // DEVICE: auto-register, then follow the backend document live
-  // --------------------------------------------------
+  // DEVICE REGISTRATION AND SUBSCRIPTIONS
 
   const loadDevice = useCallback(async (userId) => {
+    const requestId = ++deviceRequestRef.current;
+
+    const isCurrentRequest = () =>
+      deviceRequestRef.current === requestId;
+
     setDeviceLoading(true);
     setDeviceError("");
+    setPresenceReady(false);
+    setPresenceConnected(false);
 
-    const registration = await ensureDeviceRegistered(userId);
+    // Remove previous subscriptions
 
-    if (!registration.success) {
-      setDeviceData(null);
-      setDeviceError(registration.error || "Unable to register this device.");
-      setDeviceLoading(false);
-      return;
-    }
+    unsubscribePresenceRef.current?.();
+    unsubscribePresenceRef.current = null;
 
-    setDeviceId(registration.deviceId);
+    unsubscribeDeviceRef.current?.();
+    unsubscribeDeviceRef.current = null;
 
-    if (unsubscribeDeviceRef.current) {
-      unsubscribeDeviceRef.current();
-    }
+    try {
+      const registration = await ensureDeviceRegistered(userId);
 
-    unsubscribeDeviceRef.current = subscribeToDevice(
-      registration.deviceId,
-      (data) => {
-        setDeviceData(data);
+      if (!isCurrentRequest()) return;
+
+      if (!registration.success) {
+        setDeviceData(null);
+        setDeviceId(null);
+
+        setDeviceError(
+          registration.error || "Unable to register this device."
+        );
+
         setDeviceLoading(false);
-      },
-      () => {
-        setDeviceError("Unable to read the device from the server.");
-        setDeviceLoading(false);
-      }
-    );
-
-    // Update device status and report any failure.
-    const syncResult = await syncDeviceStatus(
-      registration.deviceId,
-      { includeUsage: true }
-    );
-
-    if (syncResult.success) {
-      console.log("Device status sync successful.");
-    } else {
-      console.error(
-        "Device status sync failed:",
-        syncResult.error
-      );
-    }
-  }, []);
-
-  // --------------------------------------------------
-  // LOAD PROFILE + DEVICE
-  // --------------------------------------------------
-
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      if (!currentUser) {
-        setUserData(null);
-        setCurrentUserId(null);
-        setLoading(false);
-        setDeviceLoading(false);
+        setPresenceReady(true);
         return;
       }
 
-      setCurrentUserId(currentUser.uid);
+      const registeredDeviceId = registration.deviceId;
 
-      // Fallback keeps the page usable if the Firestore profile is missing.
-      const fallbackProfile = {
-        fullName: currentUser.displayName || "User",
-        email: currentUser.email || "",
-        phone: currentUser.phoneNumber || "",
-        status: "active",
-      };
+      setDeviceId(registeredDeviceId);
 
-      try {
-        const snapshot = await getDoc(doc(db, "users", currentUser.uid));
+      // REALTIME DATABASE PRESENCE
 
-        if (snapshot.exists()) {
-          const data = snapshot.data();
+      const presenceUnsubscribe = subscribeToDevicePresence(
+        userId,
+        registeredDeviceId,
+        (data) => {
+          if (!isCurrentRequest()) return;
 
-          setUserData({ ...fallbackProfile, ...data });
+          setPresenceConnected(Boolean(data?.connected));
+          setPresenceReady(true);
+        },
+        (error) => {
+          if (!isCurrentRequest()) return;
 
-          setNotificationSettings({
-            ...DEFAULT_NOTIFICATIONS,
-            ...(data.notificationSettings || {}),
-          });
-        } else {
-          setUserData(fallbackProfile);
-          message.warning(
-            "Profile document not found. Showing account information."
-          );
+          console.error("Presence subscription error:", error);
+
+          setPresenceConnected(false);
+          setPresenceReady(true);
         }
-      } catch (error) {
-        console.error("Firestore profile loading error:", error);
-        setUserData(fallbackProfile);
+      );
 
-        message.error(
-          error.code === "permission-denied"
-            ? "Firestore permission denied. Check your security rules."
-            : "Could not load the saved profile. Showing account information."
-        );
-      } finally {
-        // Show the page now; the device section loads on its own.
-        setLoading(false);
+      if (!isCurrentRequest()) {
+        presenceUnsubscribe();
+        return;
       }
 
-      loadDevice(currentUser.uid);
-      checkPermissions();
-    });
+      unsubscribePresenceRef.current = presenceUnsubscribe;
+
+      // FIRESTORE DEVICE INFORMATION
+
+      const deviceUnsubscribe = subscribeToDevice(
+        registeredDeviceId,
+        (data) => {
+          if (!isCurrentRequest()) return;
+
+          setDeviceData(data);
+          setDeviceLoading(false);
+        },
+        (error) => {
+          if (!isCurrentRequest()) return;
+
+          console.error("Device subscription error:", error);
+
+          setDeviceError(
+            "Unable to read the device from the server."
+          );
+
+          setDeviceLoading(false);
+        }
+      );
+
+      if (!isCurrentRequest()) {
+        deviceUnsubscribe();
+        return;
+      }
+
+      unsubscribeDeviceRef.current = deviceUnsubscribe;
+
+      // INITIAL DEVICE STATUS SYNCHRONIZATION
+
+      const syncResult = await syncDeviceStatus(
+        registeredDeviceId,
+        { includeUsage: true }
+      );
+
+      if (!isCurrentRequest()) return;
+
+      if (syncResult.success) {
+        console.log("Device status sync successful.");
+      } else {
+        console.error(
+          "Device status sync failed:",
+          syncResult.error
+        );
+      }
+    } catch (error) {
+      if (!isCurrentRequest()) return;
+
+      console.error("Device loading error:", error);
+
+      setDeviceData(null);
+      setDeviceError(
+        error?.message || "Unable to load this device."
+      );
+
+      setDeviceLoading(false);
+      setPresenceReady(true);
+    }
+  }, []);
+
+  // LOAD PROFILE AND DEVICE
+
+  useEffect(() => {
+    let mounted = true;
+    let authRequestId = 0;
+
+    const unsubscribe = onAuthStateChanged(
+      auth,
+      async (currentUser) => {
+        const requestId = ++authRequestId;
+
+        if (!currentUser) {
+          deviceRequestRef.current++;
+
+          setUserData(null);
+          setCurrentUserId(null);
+          setDeviceId(null);
+          setDeviceData(null);
+          setPresenceConnected(false);
+          setPresenceReady(false);
+
+          setLoading(false);
+          setDeviceLoading(false);
+
+          unsubscribeDeviceRef.current?.();
+          unsubscribeDeviceRef.current = null;
+
+          unsubscribePresenceRef.current?.();
+          unsubscribePresenceRef.current = null;
+
+          return;
+        }
+
+        setLoading(true);
+        setCurrentUserId(currentUser.uid);
+
+        const fallbackProfile = {
+          fullName: currentUser.displayName || "User",
+          email: currentUser.email || "",
+          phone: currentUser.phoneNumber || "",
+          status: "active",
+        };
+
+        try {
+          const snapshot = await getDoc(
+            doc(db, "users", currentUser.uid)
+          );
+
+          if (!mounted || requestId !== authRequestId) return;
+
+          if (snapshot.exists()) {
+            const data = snapshot.data();
+
+            setUserData({
+              ...fallbackProfile,
+              ...data,
+            });
+
+            setNotificationSettings({
+              ...DEFAULT_NOTIFICATIONS,
+              ...(data.notificationSettings || {}),
+            });
+          } else {
+            setUserData(fallbackProfile);
+
+            message.warning(
+              "Profile document not found. Showing account information."
+            );
+          }
+        } catch (error) {
+          if (!mounted || requestId !== authRequestId) return;
+
+          console.error("Firestore profile loading error:", error);
+
+          setUserData(fallbackProfile);
+
+          message.error(
+            error.code === "permission-denied"
+              ? "Firestore permission denied. Check your security rules."
+              : "Could not load the saved profile. Showing account information."
+          );
+        } finally {
+          if (mounted && requestId === authRequestId) {
+            setLoading(false);
+          }
+        }
+
+        if (!mounted || requestId !== authRequestId) return;
+
+        loadDevice(currentUser.uid);
+        checkPermissions();
+      }
+    );
 
     return () => {
+      mounted = false;
+      authRequestId++;
+      deviceRequestRef.current++;
+
       unsubscribe();
 
-      if (unsubscribeDeviceRef.current) {
-        unsubscribeDeviceRef.current();
-      }
+      unsubscribeDeviceRef.current?.();
+      unsubscribeDeviceRef.current = null;
+
+      unsubscribePresenceRef.current?.();
+      unsubscribePresenceRef.current = null;
     };
   }, [loadDevice, checkPermissions]);
 
-  // Re-check permissions after returning from Android settings.
+  // REFRESH PERMISSIONS WHEN RETURNING FROM SETTINGS
+
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState === "visible") {
@@ -343,38 +568,52 @@ const UserProfileDashboard = () => {
     };
   }, [checkPermissions]);
 
-  // Keep "last seen" and online state fresh.
+  // KEEP LAST SEEN DISPLAY FRESH
+
   useEffect(() => {
-    const timer = setInterval(() => setClock(Date.now()), 30000);
+    const timer = setInterval(() => {
+      setClock(Date.now());
+    }, 30000);
 
     return () => clearInterval(timer);
   }, []);
 
-  // --------------------------------------------------
   // ACTIONS
-  // --------------------------------------------------
 
   const handleRefreshDevice = async () => {
     if (!currentUserId) return;
 
-    await Promise.all([loadDevice(currentUserId), checkPermissions()]);
+    await Promise.all([
+      loadDevice(currentUserId),
+      checkPermissions(),
+    ]);
   };
 
   const handleLogout = async () => {
-    // Tell the backend this phone is going offline while we still can.
-    await markDeviceOffline(deviceId);
+    try {
+      await markDeviceOffline(deviceId);
 
-    if (unsubscribeDeviceRef.current) {
-      unsubscribeDeviceRef.current();
+      deviceRequestRef.current++;
+
+      unsubscribeDeviceRef.current?.();
       unsubscribeDeviceRef.current = null;
-    }
 
-    const success = await logoutUser();
+      unsubscribePresenceRef.current?.();
+      unsubscribePresenceRef.current = null;
 
-    if (success) {
-      message.success("Logged out successfully");
-    } else {
-      message.error("Logout failed. Please try again.");
+      setPresenceConnected(false);
+      setPresenceReady(false);
+
+      const success = await logoutUser();
+
+      if (success) {
+        message.success("Logged out successfully");
+      } else {
+        message.error("Logout failed. Please try again.");
+      }
+    } catch (error) {
+      console.error("Logout error:", error);
+      message.error("Unable to complete logout.");
     }
   };
 
@@ -397,11 +636,16 @@ const UserProfileDashboard = () => {
     }
   };
 
-  const handleNotificationChange = async (settingName, checked) => {
+  const handleNotificationChange = async (
+    settingName,
+    checked
+  ) => {
     if (!currentUserId) {
       message.error("User session not found.");
       return;
     }
+
+    const previousValue = notificationSettings[settingName];
 
     setNotificationSettings((previous) => ({
       ...previous,
@@ -413,19 +657,25 @@ const UserProfileDashboard = () => {
     try {
       await setDoc(
         doc(db, "users", currentUserId),
-        { notificationSettings: { [settingName]: checked } },
+        {
+          notificationSettings: {
+            [settingName]: checked,
+          },
+        },
         { merge: true }
       );
 
       message.success(
-        checked ? "Notification enabled" : "Notification disabled"
+        checked
+          ? "Notification enabled"
+          : "Notification disabled"
       );
     } catch (error) {
       console.error("Notification Preference Error:", error);
 
       setNotificationSettings((previous) => ({
         ...previous,
-        [settingName]: !checked,
+        [settingName]: previousValue,
       }));
 
       message.error("Unable to update notification preference.");
@@ -434,9 +684,7 @@ const UserProfileDashboard = () => {
     }
   };
 
-  // --------------------------------------------------
   // LOADING / ERROR
-  // --------------------------------------------------
 
   if (loading) {
     return (
@@ -456,9 +704,7 @@ const UserProfileDashboard = () => {
     );
   }
 
-  // --------------------------------------------------
   // DERIVED VALUES
-  // --------------------------------------------------
 
   const fullName = userData.fullName || "User";
   const nameParts = fullName.trim().split(/\s+/);
@@ -466,32 +712,41 @@ const UserProfileDashboard = () => {
   let initials = nameParts[0]?.charAt(0).toUpperCase() || "U";
 
   if (nameParts.length > 1) {
-    initials += nameParts[nameParts.length - 1]?.charAt(0).toUpperCase();
+    initials += nameParts[nameParts.length - 1]
+      ?.charAt(0)
+      .toUpperCase();
   }
 
   const lastSeenMs = toMillis(deviceData?.lastSyncAt);
 
-  const isOnline =
-    deviceData?.status === "connected" &&
-    lastSeenMs > 0 &&
-    clock - lastSeenMs < ONLINE_WINDOW_MS;
+  const deviceStatus = !presenceReady
+    ? "connecting"
+    : networkConnected && presenceConnected
+      ? "online"
+      : "offline";
 
   const focusActive =
     Boolean(deviceData?.focus?.active) &&
     Number(deviceData?.focus?.endTime || 0) > clock;
 
   const missingPermission =
-    permissions.checked && (!permissions.usage || !permissions.overlay);
+    permissions.checked &&
+    (
+      !permissions.usage ||
+      !permissions.overlay ||
+      !permissions.accessibility
+    );
 
-  // --------------------------------------------------
   // UI
-  // --------------------------------------------------
 
   return (
     <div className="min-h-screen bg-slate-50 pb-24">
+
       {/* HEADER */}
       <div className="rounded-b-[32px] bg-blue-900 px-5 pb-10 pt-8">
-        <h1 className="text-2xl font-bold text-white">Profile</h1>
+        <h1 className="text-2xl font-bold text-white">
+          Profile
+        </h1>
 
         <p className="mt-1 text-sm text-blue-200">
           Manage your Smart Shield account
@@ -518,10 +773,11 @@ const UserProfileDashboard = () => {
               </p>
 
               <span
-                className={`mt-2 inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${userData.status === "active"
+                className={`mt-2 inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${
+                  userData.status === "active"
                     ? "bg-green-50 text-green-700"
                     : "bg-slate-100 text-slate-600"
-                  }`}
+                }`}
               >
                 {userData.status === "active"
                   ? "Active Account"
@@ -539,6 +795,7 @@ const UserProfileDashboard = () => {
         </h2>
 
         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+
           <div className="flex items-center gap-4 border-b border-slate-100 p-4">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100">
               <UserOutlined className="text-slate-600" />
@@ -546,7 +803,9 @@ const UserProfileDashboard = () => {
 
             <div>
               <p className="text-xs text-slate-400">Full Name</p>
-              <p className="text-sm font-medium text-slate-800">{fullName}</p>
+              <p className="text-sm font-medium text-slate-800">
+                {fullName}
+              </p>
             </div>
           </div>
 
@@ -568,7 +827,7 @@ const UserProfileDashboard = () => {
               <PhoneOutlined className="text-slate-600" />
             </div>
 
-            <div className="min-w-0 flex-1">
+            <div className="min-w-0">
               <p className="text-xs text-slate-400">Phone</p>
               <p className="text-sm font-medium text-slate-800">
                 {userData.phone || "Not added"}
@@ -582,7 +841,9 @@ const UserProfileDashboard = () => {
             </div>
 
             <div className="min-w-0 flex-1">
-              <p className="text-xs text-slate-400">Firebase User UID</p>
+              <p className="text-xs text-slate-400">
+                Firebase User UID
+              </p>
 
               <p className="mt-1 break-all text-sm font-medium text-slate-800">
                 {currentUserId || "UID unavailable"}
@@ -602,6 +863,7 @@ const UserProfileDashboard = () => {
               </p>
             </div>
           </div>
+
         </div>
       </div>
 
@@ -631,6 +893,7 @@ const UserProfileDashboard = () => {
               <p className="text-sm font-medium text-slate-900">
                 Registering this device...
               </p>
+
               <p className="text-xs text-slate-500">
                 Checking the connection with Smart Shield
               </p>
@@ -638,6 +901,7 @@ const UserProfileDashboard = () => {
           </div>
         ) : deviceData ? (
           <div className="rounded-xl border border-slate-200 bg-white p-4">
+
             <div className="flex items-center gap-3">
               <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-50">
                 <MobileOutlined className="text-xl text-blue-600" />
@@ -656,12 +920,21 @@ const UserProfileDashboard = () => {
 
                 <div className="mt-1 flex items-center gap-2">
                   <span
-                    className={`h-2 w-2 rounded-full ${isOnline ? "bg-green-500" : "bg-slate-400"
-                      }`}
+                    className={`h-2 w-2 rounded-full ${
+                      deviceStatus === "online"
+                        ? "bg-green-500"
+                        : deviceStatus === "connecting"
+                          ? "bg-amber-400"
+                          : "bg-slate-400"
+                    }`}
                   />
 
                   <span className="text-xs text-slate-500">
-                    {isOnline ? "Device connected" : "Device offline"}
+                    {deviceStatus === "online"
+                      ? "Device connected"
+                      : deviceStatus === "connecting"
+                        ? "Connecting..."
+                        : "Device offline"}
                   </span>
                 </div>
               </div>
@@ -669,14 +942,20 @@ const UserProfileDashboard = () => {
 
             <div className="mt-4 grid grid-cols-2 gap-3">
               <div className="rounded-xl bg-slate-50 p-3">
-                <p className="text-[11px] text-slate-400">Android</p>
+                <p className="text-[11px] text-slate-400">
+                  Android
+                </p>
+
                 <p className="mt-1 text-sm font-semibold text-slate-800">
                   {deviceData.androidVersion || "Unknown"}
                 </p>
               </div>
 
               <div className="rounded-xl bg-slate-50 p-3">
-                <p className="text-[11px] text-slate-400">Last seen</p>
+                <p className="text-[11px] text-slate-400">
+                  Last seen
+                </p>
+
                 <p className="mt-1 text-sm font-semibold text-slate-800">
                   {formatLastSeen(lastSeenMs, clock)}
                 </p>
@@ -686,10 +965,13 @@ const UserProfileDashboard = () => {
             {focusActive && (
               <div className="mt-3 rounded-xl bg-blue-50 p-3 text-xs text-blue-700">
                 Focus Mode is on until{" "}
-                {new Date(deviceData.focus.endTime).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
+                {new Date(deviceData.focus.endTime).toLocaleTimeString(
+                  [],
+                  {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  }
+                )}
                 .
               </div>
             )}
@@ -697,16 +979,21 @@ const UserProfileDashboard = () => {
             {missingPermission && (
               <button
                 type="button"
-                onClick={() => setSecurityModalOpen(true)}
+                onClick={() => {
+                  checkPermissions();
+                  setSecurityModalOpen(true);
+                }}
                 className="mt-3 flex w-full items-start gap-2 rounded-xl bg-amber-50 p-3 text-left text-xs text-amber-800"
               >
                 <WarningOutlined className="mt-0.5" />
+
                 <span>
-                  Some permissions are off. Usage reports and Focus Mode can't
-                  work fully until you allow them. Tap to fix.
+                  Some permissions are off. Usage reports and Focus Mode may
+                  not work fully. Tap here to enable all required permissions.
                 </span>
               </button>
             )}
+
           </div>
         ) : (
           <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4">
@@ -729,7 +1016,6 @@ const UserProfileDashboard = () => {
           </div>
         )}
 
-        {/* Transparency note */}
         {deviceData && (
           <p className="mt-3 text-xs leading-5 text-slate-500">
             Remote management is on: your Smart Shield admin can see this
@@ -746,11 +1032,12 @@ const UserProfileDashboard = () => {
         </h3>
 
         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+
           <button
             type="button"
             onClick={() => {
-              checkPermissions();
               setSecurityModalOpen(true);
+              checkPermissions();
             }}
             className="flex w-full items-center gap-4 border-b border-slate-100 p-4 text-left"
           >
@@ -788,6 +1075,7 @@ const UserProfileDashboard = () => {
 
             <RightOutlined className="text-slate-400" />
           </button>
+
         </div>
       </div>
 
@@ -823,6 +1111,7 @@ const UserProfileDashboard = () => {
         width={450}
       >
         <div className="mt-5 space-y-3">
+
           <PermissionRow
             icon={<MobileOutlined className="text-lg text-blue-600" />}
             tone="bg-blue-50"
@@ -842,15 +1131,48 @@ const UserProfileDashboard = () => {
           />
 
           <PermissionRow
-            icon={<CheckCircleFilled className="text-lg text-purple-600" />}
+            icon={<SafetyOutlined className="text-lg text-purple-600" />}
             tone="bg-purple-50"
+            title="Accessibility Service"
+            description="Required to detect and block restricted apps during Focus Mode"
+            granted={permissions.accessibility}
+            onAllow={
+              permissions.accessibility
+                ? undefined
+                : openAccessibilitySettings
+            }
+          />
+
+          {permissions.accessibility && (
+            <div className="rounded-lg bg-slate-50 px-3 py-3 text-xs text-slate-600">
+              <div className="flex items-center justify-between gap-2">
+                <span>Accessibility service connection</span>
+
+                <span
+                  className={
+                    permissions.accessibilityConnected
+                      ? "font-semibold text-green-600"
+                      : "font-semibold text-amber-600"
+                  }
+                >
+                  {permissions.accessibilityConnected
+                    ? "Connected"
+                    : "Enabled — waiting for connection"}
+                </span>
+              </div>
+            </div>
+          )}
+
+          <PermissionRow
+            icon={<CheckCircleFilled className="text-lg text-green-600" />}
+            tone="bg-green-50"
             title="Device registration"
             description="This phone is linked to your account"
             granted={Boolean(deviceData)}
           />
 
           <Button block onClick={checkPermissions}>
-            I've changed a permission
+            <ReloadOutlined /> Refresh Permission Status
           </Button>
 
           <div className="rounded-xl border border-slate-100 bg-slate-50 p-3">
@@ -860,6 +1182,7 @@ const UserProfileDashboard = () => {
               background.
             </p>
           </div>
+
         </div>
       </Modal>
 
@@ -883,6 +1206,7 @@ const UserProfileDashboard = () => {
         width={450}
       >
         <div className="mt-5 space-y-3">
+
           <NotificationRow
             icon={<BellOutlined className="text-lg text-blue-600" />}
             tone="bg-blue-50"
@@ -937,6 +1261,7 @@ const UserProfileDashboard = () => {
               and will remain active when you sign in again.
             </p>
           </div>
+
         </div>
       </Modal>
 
@@ -944,6 +1269,7 @@ const UserProfileDashboard = () => {
         activeTab={activeTab}
         onTabChange={setActiveTab}
       />
+
     </div>
   );
 };

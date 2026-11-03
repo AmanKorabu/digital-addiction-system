@@ -2,6 +2,7 @@ package com.smartshield.app.plugins;
 
 import android.Manifest;
 import android.app.AppOpsManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -14,6 +15,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Process;
 import android.provider.Settings;
+import android.telecom.TelecomManager;
 import android.util.Base64;
 import android.util.Log;
 
@@ -44,9 +46,116 @@ public class FocusModePlugin extends Plugin {
     private static final String TAG = "FocusModePlugin";
     private static final int ICON_SIZE = 72;
     private static final long MIN_SESSION_MS = 60L * 1000L;
+    private static final long MAX_SESSION_MS = 24L * 60L * 60L * 1000L;
+    private static final String POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS";
 
     // =========================================================
-    // PERMISSIONS
+    // ACCESSIBILITY (the main enforcement mechanism)
+    // =========================================================
+
+    /**
+     * granted   = the user switched Smart Shield on in Accessibility settings.
+     * connected = Android has the service running right now.
+     * Real enforcement needs both; "granted" can be true for a moment
+     * before "connected" after the app starts.
+     */
+    @PluginMethod
+    public void hasAccessibilityPermission(PluginCall call) {
+        try {
+            JSObject result = new JSObject();
+            result.put("granted", isAccessibilityServiceEnabled());
+            result.put("connected", FocusAccessibilityService.connected);
+            call.resolve(result);
+
+        } catch (Exception error) {
+            Log.e(TAG, "Accessibility permission check failed", error);
+            call.reject("Unable to check Accessibility permission.", error);
+        }
+    }
+
+    @PluginMethod
+    public void openAccessibilitySettings(PluginCall call) {
+        try {
+            Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+            getContext().startActivity(intent);
+
+            call.resolve();
+
+        } catch (Exception error) {
+            Log.e(TAG, "Unable to open Accessibility settings", error);
+            call.reject("Unable to open Accessibility settings.", error);
+        }
+    }
+
+    /** True when Smart Shield's accessibility service is switched on in Settings. */
+    private boolean isAccessibilityServiceEnabled() {
+        if (FocusAccessibilityService.connected) {
+            return true;
+        }
+
+        try {
+            int enabled = Settings.Secure.getInt(
+                    getContext().getContentResolver(),
+                    Settings.Secure.ACCESSIBILITY_ENABLED,
+                    0
+            );
+
+            if (enabled != 1) {
+                return false;
+            }
+
+            String enabledServices = Settings.Secure.getString(
+                    getContext().getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            );
+
+            if (enabledServices == null || enabledServices.isEmpty()) {
+                return false;
+            }
+
+            ComponentName expected = new ComponentName(
+                    getContext(),
+                    FocusAccessibilityService.class
+            );
+
+            // Compare parsed components, because some phones store the short
+            // form (".plugins.X") and others the full class name.
+            for (String entry : enabledServices.split(":")) {
+                ComponentName component = ComponentName.unflattenFromString(entry);
+
+                if (component != null && component.equals(expected)) {
+                    return true;
+                }
+            }
+
+        } catch (Exception error) {
+            Log.w(TAG, "Could not read enabled accessibility services", error);
+        }
+
+        return false;
+    }
+
+    /**
+     * "accessibility" = reliable blocking is running
+     * "limited"       = only the older overlay fallback is possible
+     * "none"          = nothing can block apps right now
+     */
+    private String enforcementMode() {
+        if (FocusAccessibilityService.connected) {
+            return "accessibility";
+        }
+
+        if (canDrawOverlays() && isUsageAccessGranted()) {
+            return "limited";
+        }
+
+        return "none";
+    }
+
+    // =========================================================
+    // OTHER PERMISSIONS
     // =========================================================
 
     @PluginMethod
@@ -73,6 +182,40 @@ public class FocusModePlugin extends Plugin {
             Log.e(TAG, "Unable to open overlay settings", error);
             call.reject("Unable to open overlay permission settings.", error);
         }
+    }
+
+    @PluginMethod
+    public void hasUsageAccessPermission(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("granted", isUsageAccessGranted());
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void openUsageAccessSettings(PluginCall call) {
+        try {
+            Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(intent);
+
+            call.resolve();
+
+        } catch (Exception error) {
+            Log.e(TAG, "Unable to open usage access settings", error);
+            call.reject("Unable to open usage access settings.", error);
+        }
+    }
+
+    /** One call for the permission screen: everything the session needs. */
+    @PluginMethod
+    public void getPermissionStatus(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("accessibility", isAccessibilityServiceEnabled());
+        result.put("accessibilityConnected", FocusAccessibilityService.connected);
+        result.put("overlay", canDrawOverlays());
+        result.put("usageAccess", isUsageAccessGranted());
+        result.put("notifications", isNotificationPermissionGranted());
+        call.resolve(result);
     }
 
     private boolean canDrawOverlays() {
@@ -116,32 +259,76 @@ public class FocusModePlugin extends Plugin {
         return mode == AppOpsManager.MODE_ALLOWED;
     }
 
+    private boolean isNotificationPermissionGranted() {
+        if (Build.VERSION.SDK_INT < 33) {
+            return true;
+        }
+
+        return ContextCompat.checkSelfPermission(getContext(), POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
     private void requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT < 33 || getActivity() == null) {
+        if (getActivity() == null || isNotificationPermissionGranted()) {
             return;
         }
 
-        if (ContextCompat.checkSelfPermission(
-                getContext(), "android.permission.POST_NOTIFICATIONS"
-        ) != PackageManager.PERMISSION_GRANTED) {
+        ActivityCompat.requestPermissions(
+                getActivity(),
+                new String[]{POST_NOTIFICATIONS},
+                4101
+        );
+    }
 
-            ActivityCompat.requestPermissions(
-                    getActivity(),
-                    new String[]{"android.permission.POST_NOTIFICATIONS"},
-                    4101
-            );
+    // =========================================================
+    // APPS THAT MUST NEVER BE BLOCKED
+    // =========================================================
+
+    /**
+     * Safety net for a wellbeing app: the user must always be able to make
+     * calls (including emergency calls). Add more packages here if needed.
+     */
+    private Set<String> getProtectedPackages() {
+        Set<String> protectedPackages = new HashSet<>();
+
+        protectedPackages.add(getContext().getPackageName());
+        protectedPackages.add("com.android.phone");
+        protectedPackages.add("com.android.dialer");
+        protectedPackages.add("com.google.android.dialer");
+        protectedPackages.add("com.android.emergency");
+
+        try {
+            TelecomManager telecom = (TelecomManager)
+                    getContext().getSystemService(Context.TELECOM_SERVICE);
+
+            if (telecom != null) {
+                String dialer = telecom.getDefaultDialerPackage();
+
+                if (dialer != null) {
+                    protectedPackages.add(dialer);
+                }
+            }
+        } catch (Exception error) {
+            Log.w(TAG, "Could not resolve default dialer", error);
         }
+
+        return protectedPackages;
     }
 
     // =========================================================
     // APP LIST FOR THE PICKER
     // =========================================================
 
+    /**
+     * NOTE: on Android 11+ this only sees launcher apps if the manifest has a
+     * <queries> block for ACTION_MAIN / CATEGORY_LAUNCHER and CATEGORY_HOME
+     * (or QUERY_ALL_PACKAGES). Without it the list comes back nearly empty.
+     */
     @PluginMethod
     public void getLaunchableApps(PluginCall call) {
         try {
             PackageManager pm = getContext().getPackageManager();
-            String ownPackage = getContext().getPackageName();
+            Set<String> protectedPackages = getProtectedPackages();
 
             Set<String> homePackages = new HashSet<>();
 
@@ -175,7 +362,7 @@ public class FocusModePlugin extends Plugin {
                     String packageName = info.activityInfo.packageName;
 
                     if (packageName == null
-                            || packageName.equals(ownPackage)
+                            || protectedPackages.contains(packageName)
                             || homePackages.contains(packageName)
                             || !seen.add(packageName)) {
                         continue;
@@ -225,11 +412,19 @@ public class FocusModePlugin extends Plugin {
     @PluginMethod
     public void startFocusSession(PluginCall call) {
         try {
+            normalizeExpiredSession();
+
+            if (prefs().getBoolean(FocusService.KEY_ACTIVE, false)) {
+                call.reject("A focus session is already running.");
+                return;
+            }
+
             JSObject data = call.getData();
 
             long durationMs = data.optLong("durationMs", 0L);
             JSONArray packageArray = data.optJSONArray("packages");
 
+            Set<String> protectedPackages = getProtectedPackages();
             Set<String> packages = new HashSet<>();
 
             if (packageArray != null) {
@@ -237,7 +432,7 @@ public class FocusModePlugin extends Plugin {
                     String packageName = packageArray.optString(i, "");
 
                     if (!packageName.isEmpty()
-                            && !packageName.equals(getContext().getPackageName())) {
+                            && !protectedPackages.contains(packageName)) {
                         packages.add(packageName);
                     }
                 }
@@ -253,13 +448,18 @@ public class FocusModePlugin extends Plugin {
                 return;
             }
 
-            if (!canDrawOverlays()) {
-                call.reject("Allow \"Display over other apps\" for Smart Shield first.");
+            if (durationMs > MAX_SESSION_MS) {
+                call.reject("Choose a session of 24 hours or less.");
                 return;
             }
 
-            if (!isUsageAccessGranted()) {
-                call.reject("Allow Usage Access for Smart Shield first.");
+            // Do not start a session that cannot actually block anything.
+            if (!isAccessibilityServiceEnabled()) {
+                call.reject(
+                        "Turn on Smart Shield in Accessibility settings first, "
+                                + "otherwise apps cannot be blocked.",
+                        "ACCESSIBILITY_REQUIRED"
+                );
                 return;
             }
 
@@ -267,8 +467,9 @@ public class FocusModePlugin extends Plugin {
 
             long now = System.currentTimeMillis();
 
-            getContext()
-                    .getSharedPreferences(FocusService.PREFS_NAME, Context.MODE_PRIVATE)
+            // commit() (not apply()) so the services are guaranteed to read the
+            // new session when they start a moment later.
+            boolean saved = prefs()
                     .edit()
                     .putBoolean(FocusService.KEY_ACTIVE, true)
                     .putLong(FocusService.KEY_START, now)
@@ -277,7 +478,12 @@ public class FocusModePlugin extends Plugin {
                     .putInt(FocusService.KEY_ATTEMPTS, 0)
                     .putBoolean(FocusService.KEY_COMPLETED, false)
                     .putLong(FocusService.KEY_STOPPED_AT, 0L)
-                    .apply();
+                    .commit();
+
+            if (!saved) {
+                call.reject("Unable to save the focus session.");
+                return;
+            }
 
             startFocusService();
 
@@ -306,7 +512,7 @@ public class FocusModePlugin extends Plugin {
                                 FocusService.KEY_STOPPED_AT,
                                 Math.min(System.currentTimeMillis(), end)
                         )
-                        .apply();
+                        .commit();
             }
 
             stopFocusService();
@@ -364,7 +570,7 @@ public class FocusModePlugin extends Plugin {
                     .putBoolean(FocusService.KEY_ACTIVE, false)
                     .putBoolean(FocusService.KEY_COMPLETED, true)
                     .putLong(FocusService.KEY_STOPPED_AT, end)
-                    .apply();
+                    .commit();
 
             stopFocusService();
         }
@@ -382,6 +588,8 @@ public class FocusModePlugin extends Plugin {
             }
         }
 
+        String mode = enforcementMode();
+
         JSObject status = new JSObject();
         status.put("active", prefs.getBoolean(FocusService.KEY_ACTIVE, false));
         status.put("startTime", prefs.getLong(FocusService.KEY_START, 0L));
@@ -391,6 +599,12 @@ public class FocusModePlugin extends Plugin {
         status.put("completed", prefs.getBoolean(FocusService.KEY_COMPLETED, false));
         status.put("stoppedAt", prefs.getLong(FocusService.KEY_STOPPED_AT, 0L));
         status.put("now", System.currentTimeMillis());
+
+        // Honest enforcement report for the UI.
+        status.put("accessibilityEnabled", isAccessibilityServiceEnabled());
+        status.put("accessibilityConnected", FocusAccessibilityService.connected);
+        status.put("enforcementMode", mode);
+        status.put("enforcementReady", "accessibility".equals(mode));
 
         return status;
     }

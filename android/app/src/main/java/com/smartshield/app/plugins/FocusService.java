@@ -43,6 +43,12 @@ import java.util.Set;
  * blocked list, covers it with a full-screen overlay until the user goes home
  * or the session ends.
  *
+ * CHANGE: when FocusAccessibilityService is connected, it is the only thing
+ * that blocks apps. This service then keeps the notification and session
+ * lifecycle going but draws NO overlay, so two different blocking screens
+ * never compete. If the accessibility service is not connected, this
+ * service falls back to its own overlay exactly as before.
+ *
  * Session state lives in SharedPreferences so it survives the app/process
  * being killed. The React side reads it through FocusModePlugin.
  */
@@ -170,6 +176,16 @@ public class FocusService extends Service {
                 return;
             }
 
+            // The accessibility service is the single blocking mechanism while
+            // it is connected. Remove any overlay of ours and draw nothing, so
+            // there are never two different blocking screens.
+            if (FocusAccessibilityService.connected) {
+                hideOverlay();
+                handler.postDelayed(this, POLL_MS);
+                return;
+            }
+
+            // Fallback: accessibility service not connected, block ourselves.
             try {
                 refreshForeground(now);
             } catch (Exception error) {
@@ -273,7 +289,7 @@ public class FocusService extends Service {
     }
 
     // =========================================================
-    // OVERLAY
+    // OVERLAY (fallback only, used when accessibility is not connected)
     // =========================================================
 
     private boolean canDrawOverlays() {

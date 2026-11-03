@@ -23,6 +23,17 @@ export const hasOverlayPermission = () =>
 
 export const openOverlaySettings = () =>
     run(() => FocusMode.openOverlaySettings(), "Unable to open overlay settings.");
+export const hasAccessibilityPermission = () =>
+    run(
+        () => FocusMode.hasAccessibilityPermission(),
+        "Unable to check accessibility permission."
+    );
+
+export const openAccessibilitySettings = () =>
+    run(
+        () => FocusMode.openAccessibilitySettings(),
+        "Unable to open accessibility settings."
+    );
 
 export const getLaunchableApps = () =>
     run(() => FocusMode.getLaunchableApps(), "Unable to load installed apps.");

@@ -1,10 +1,8 @@
-
 import {
   ref,
   onValue,
   onDisconnect,
   set,
-  update,
   remove,
   push,
   serverTimestamp,
@@ -12,13 +10,9 @@ import {
 
 import { rtdb } from "../config/firebase";
 
-export const PRESENCE_HEARTBEAT_MS = 10000;
-export const PRESENCE_TIMEOUT_MS = 30000;
-const DASHBOARD_CHECK_MS = 5000;
-
-// =============================================
+// --------------------------------------------------
 // START DEVICE PRESENCE
-// =============================================
+// --------------------------------------------------
 
 export const startDevicePresence = (
   userId,
@@ -31,50 +25,24 @@ export const startDevicePresence = (
   }
 
   const connectionInfoRef = ref(rtdb, ".info/connected");
+
   const devicePresenceRef = ref(
     rtdb,
     `presence/${userId}/${deviceId}`
   );
 
   let stopped = false;
-  let registering = false;
   let databaseConnected = false;
+  let registering = false;
   let activeConnectionRef = null;
-  let heartbeatTimer = null;
+  let lastReportedState = null;
+  let connectionGeneration = 0;
 
-  const stopHeartbeat = () => {
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
-    }
-  };
+  const notifyConnection = (connected) => {
+    if (lastReportedState === connected) return;
 
-  const startHeartbeat = (connectionRef) => {
-    stopHeartbeat();
-
-    heartbeatTimer = setInterval(async () => {
-      if (
-        stopped ||
-        !databaseConnected ||
-        activeConnectionRef !== connectionRef
-      ) {
-        return;
-      }
-
-      try {
-        await update(connectionRef, {
-          lastSeen: serverTimestamp(),
-        });
-
-        console.log("SMART SHIELD PRESENCE HEARTBEAT:", deviceId);
-      } catch (error) {
-        console.error(
-          "SMART SHIELD PRESENCE HEARTBEAT ERROR:",
-          error
-        );
-        onError?.(error);
-      }
-    }, PRESENCE_HEARTBEAT_MS);
+    lastReportedState = connected;
+    onConnectionChange?.(connected);
   };
 
   const registerConnection = async () => {
@@ -89,13 +57,23 @@ export const startDevicePresence = (
 
     registering = true;
 
+    const generation = connectionGeneration;
     const connectionRef = push(devicePresenceRef);
 
+    let disconnectHandlerRegistered = false;
+    let connectionWritten = false;
+
     try {
-      // Register server-side cleanup BEFORE writing presence.
+      // Register server-side cleanup first.
       await onDisconnect(connectionRef).remove();
 
-      if (stopped || !databaseConnected) {
+      disconnectHandlerRegistered = true;
+
+      if (
+        stopped ||
+        !databaseConnected ||
+        generation !== connectionGeneration
+      ) {
         await onDisconnect(connectionRef).cancel();
         return;
       }
@@ -105,77 +83,103 @@ export const startDevicePresence = (
         userId,
         deviceId,
         connectedAt: serverTimestamp(),
-        lastSeen: serverTimestamp(),
       });
 
-      if (stopped || !databaseConnected) {
+      connectionWritten = true;
+
+      if (
+        stopped ||
+        !databaseConnected ||
+        generation !== connectionGeneration
+      ) {
         await remove(connectionRef);
-        await onDisconnect(connectionRef).cancel();
+
+        if (disconnectHandlerRegistered) {
+          await onDisconnect(connectionRef).cancel();
+        }
+
         return;
       }
 
       activeConnectionRef = connectionRef;
 
-      startHeartbeat(connectionRef);
+      notifyConnection(true);
 
-      onConnectionChange?.(true);
-
-      console.log(
-        "SMART SHIELD PRESENCE CONNECTED:",
-        userId,
-        deviceId,
-        connectionRef.key
-      );
+      console.log("SMART SHIELD: Firebase presence connected");
     } catch (error) {
-      console.error(
-        "SMART SHIELD PRESENCE REGISTRATION ERROR:",
-        error
-      );
+      console.error("Presence registration error:", error);
+
+      if (connectionWritten) {
+        try {
+          await remove(connectionRef);
+        } catch (cleanupError) {
+          console.error("Presence cleanup error:", cleanupError);
+        }
+      }
+
+      if (disconnectHandlerRegistered) {
+        try {
+          await onDisconnect(connectionRef).cancel();
+        } catch (cleanupError) {
+          console.error("Disconnect cancellation error:", cleanupError);
+        }
+      }
+
       onError?.(error);
     } finally {
       registering = false;
+
+      // If Firebase reconnected while registration was running,
+      // attempt registration again.
+      if (
+        !stopped &&
+        databaseConnected &&
+        !activeConnectionRef &&
+        generation !== connectionGeneration
+      ) {
+        registerConnection();
+      }
     }
   };
 
   const unsubscribe = onValue(
     connectionInfoRef,
     (snapshot) => {
-      databaseConnected = snapshot.val() === true;
+      if (stopped) return;
 
-      console.log(
-        "SMART SHIELD RTDB CONNECTION:",
-        databaseConnected
-      );
+      const connected = snapshot.val() === true;
 
-      if (!databaseConnected) {
-        stopHeartbeat();
+      databaseConnected = connected;
+
+      if (!connected) {
+        connectionGeneration++;
         activeConnectionRef = null;
-        onConnectionChange?.(false);
+
+        notifyConnection(false);
         return;
       }
 
       registerConnection();
     },
     (error) => {
-      console.error(
-        "SMART SHIELD RTDB LISTENER ERROR:",
-        error
-      );
+      if (stopped) return;
 
-      stopHeartbeat();
+      databaseConnected = false;
+      connectionGeneration++;
       activeConnectionRef = null;
-      onConnectionChange?.(false);
+
+      notifyConnection(false);
       onError?.(error);
     }
   );
 
-  // =============================================
   // CLEANUP
-  // =============================================
 
-  const stop = async () => {
+  return async () => {
     stopped = true;
-    stopHeartbeat();
+    databaseConnected = false;
+    connectionGeneration++;
+
     unsubscribe();
 
     const connectionRef = activeConnectionRef;
@@ -185,27 +189,16 @@ export const startDevicePresence = (
       try {
         await remove(connectionRef);
         await onDisconnect(connectionRef).cancel();
-
-        console.log(
-          "SMART SHIELD PRESENCE STOPPED:",
-          userId,
-          deviceId
-        );
       } catch (error) {
-        console.error(
-          "SMART SHIELD PRESENCE CLEANUP ERROR:",
-          error
-        );
+        console.error("Presence cleanup error:", error);
       }
     }
   };
-
-  return stop;
 };
 
-// =============================================
-// ADMIN DASHBOARD PRESENCE SUBSCRIPTION
-// =============================================
+// --------------------------------------------------
+// SUBSCRIBE TO DEVICE PRESENCE
+// --------------------------------------------------
 
 export const subscribeToDevicePresence = (
   userId,
@@ -213,71 +206,32 @@ export const subscribeToDevicePresence = (
   onData,
   onError
 ) => {
+  if (!userId || !deviceId) {
+    throw new Error("User ID and Device ID are required.");
+  }
+
   const presenceRef = ref(
     rtdb,
     `presence/${userId}/${deviceId}`
   );
 
-  let latestConnections = {};
-
-  const calculatePresence = () => {
-    const now = Date.now();
-
-    const connections = Object.entries(latestConnections).reduce(
-      (result, [connectionId, connection]) => {
-        if (
-          connection &&
-          typeof connection === "object"
-        ) {
-          result[connectionId] = connection;
-        }
-
-        return result;
-      },
-      {}
-    );
-
-    const connected = Object.values(connections).some(
-      (connection) => {
-        const lastSeen = Number(connection.lastSeen);
-
-        return (
-          connection.state === "connected" &&
-          Number.isFinite(lastSeen) &&
-          now - lastSeen <= PRESENCE_TIMEOUT_MS
-        );
-      }
-    );
-
-    onData?.({
-      connected,
-      connections,
-    });
-  };
-
-  const unsubscribe = onValue(
+  return onValue(
     presenceRef,
     (snapshot) => {
-      latestConnections = snapshot.val() || {};
-      calculatePresence();
+      const connections = snapshot.val() || {};
+
+      const connected = Object.values(connections).some(
+        (connection) => connection?.state === "connected"
+      );
+
+      onData?.({
+        connected,
+        connections,
+      });
     },
     (error) => {
-      console.error(
-        "SMART SHIELD PRESENCE SUBSCRIPTION ERROR:",
-        error
-      );
+      console.error("Presence subscription error:", error);
       onError?.(error);
     }
   );
-
-  // Recalculate even if no new Firebase event arrives.
-  const checkTimer = setInterval(
-    calculatePresence,
-    DASHBOARD_CHECK_MS
-  );
-
-  return () => {
-    unsubscribe();
-    clearInterval(checkTimer);
-  };
 };

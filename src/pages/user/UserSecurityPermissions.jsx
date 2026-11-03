@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { App } from "@capacitor/app";
@@ -14,11 +13,7 @@ import {
 const FocusMode = registerPlugin("FocusMode");
 
 const getPermissionValue = (result, keys) => {
-    const values = [
-        result,
-        result?.data,
-        result?.result,
-    ];
+    const values = [result, result?.data, result?.result];
 
     for (const value of values) {
         if (typeof value === "boolean") return value;
@@ -41,6 +36,7 @@ const UserSecurityPermissions = () => {
     const [usageGranted, setUsageGranted] = useState(false);
     const [overlayGranted, setOverlayGranted] = useState(false);
     const [notificationsGranted, setNotificationsGranted] = useState(false);
+    const [accessibilityGranted, setAccessibilityGranted] = useState(false);
 
     const [checking, setChecking] = useState(true);
     const [busy, setBusy] = useState("");
@@ -49,29 +45,32 @@ const UserSecurityPermissions = () => {
         setChecking(true);
 
         try {
-            const [usageResult, overlayResult, notificationResult] =
-                await Promise.all([
-                    hasUsageAccess(),
-                    FocusMode.hasOverlayPermission(),
-                    LocalNotifications.checkPermissions(),
-                ]);
+            const [
+                usageResult,
+                overlayResult,
+                notificationResult,
+                accessibilityResult,
+            ] = await Promise.all([
+                hasUsageAccess(),
+                FocusMode.hasOverlayPermission(),
+                LocalNotifications.checkPermissions(),
+                FocusMode.hasAccessibilityPermission(),
+            ]);
 
             setUsageGranted(
-                getPermissionValue(usageResult, [
-                    "hasAccess",
-                    "granted",
-                ])
+                getPermissionValue(usageResult, ["hasAccess", "granted"])
             );
 
             setOverlayGranted(
-                getPermissionValue(overlayResult, [
-                    "hasPermission",
-                    "granted",
-                ])
+                getPermissionValue(overlayResult, ["hasPermission", "granted"])
             );
 
             setNotificationsGranted(
                 notificationResult.display === "granted"
+            );
+
+            setAccessibilityGranted(
+                getPermissionValue(accessibilityResult, ["granted"])
             );
 
         } catch (error) {
@@ -122,11 +121,9 @@ const UserSecurityPermissions = () => {
 
         try {
             await openUsageAccessSettings();
-            message.info(
-                "Enable Usage Access in Android Settings, then return to Smart Shield."
-            );
+            message.info("Enable Usage Access, then return to Smart Shield.");
         } catch (error) {
-            console.error("Usage Access error:", error);
+            console.error(error);
             message.error("Could not open Usage Access settings.");
         } finally {
             setBusy("");
@@ -138,13 +135,27 @@ const UserSecurityPermissions = () => {
 
         try {
             await FocusMode.openOverlaySettings();
+            message.info("Allow Display over other apps, then return.");
+        } catch (error) {
+            console.error(error);
+            message.error("Could not open overlay settings.");
+        } finally {
+            setBusy("");
+        }
+    };
+
+    const requestAccessibilityAccess = async () => {
+        setBusy("accessibility");
+
+        try {
+            await FocusMode.openAccessibilitySettings();
 
             message.info(
-                "Allow display over other apps, then return to Smart Shield."
+                "Find Smart Shield under installed Accessibility services and enable it."
             );
         } catch (error) {
-            console.error("Overlay permission error:", error);
-            message.error("Could not open overlay settings.");
+            console.error(error);
+            message.error("Could not open Accessibility settings.");
         } finally {
             setBusy("");
         }
@@ -154,9 +165,7 @@ const UserSecurityPermissions = () => {
         setBusy("notifications");
 
         try {
-            const result =
-                await LocalNotifications.requestPermissions();
-
+            const result = await LocalNotifications.requestPermissions();
             const granted = result.display === "granted";
 
             setNotificationsGranted(granted);
@@ -164,12 +173,10 @@ const UserSecurityPermissions = () => {
             if (granted) {
                 message.success("Notification permission granted.");
             } else {
-                message.warning(
-                    "Notification permission was not granted."
-                );
+                message.warning("Notification permission was not granted.");
             }
         } catch (error) {
-            console.error("Notification permission error:", error);
+            console.error(error);
             message.error("Could not request notification permission.");
         } finally {
             setBusy("");
@@ -179,7 +186,8 @@ const UserSecurityPermissions = () => {
     const allGranted =
         usageGranted &&
         overlayGranted &&
-        notificationsGranted;
+        notificationsGranted &&
+        accessibilityGranted;
 
     return (
         <main className="min-h-screen bg-slate-50 px-5 py-10">
@@ -203,7 +211,7 @@ const UserSecurityPermissions = () => {
 
                         <PermissionRow
                             title="Usage Access"
-                            description="Allows Smart Shield to read app usage and calculate screen time."
+                            description="Allows Smart Shield to read app usage."
                             granted={usageGranted}
                             loading={busy === "usage"}
                             onAllow={requestUsageAccess}
@@ -211,15 +219,23 @@ const UserSecurityPermissions = () => {
 
                         <PermissionRow
                             title="Display over other apps"
-                            description="Allows Focus Mode to display blocking screens over selected apps."
+                            description="Allows Focus Mode to display blocking screens."
                             granted={overlayGranted}
                             loading={busy === "overlay"}
                             onAllow={requestOverlayAccess}
                         />
 
                         <PermissionRow
+                            title="Accessibility Service"
+                            description="Allows Smart Shield to detect when selected apps are opened and apply Focus Mode restrictions."
+                            granted={accessibilityGranted}
+                            loading={busy === "accessibility"}
+                            onAllow={requestAccessibilityAccess}
+                        />
+
+                        <PermissionRow
                             title="Notifications"
-                            description="Allows Smart Shield to show notifications, including background monitoring notifications."
+                            description="Allows Smart Shield to show monitoring notifications."
                             granted={notificationsGranted}
                             loading={busy === "notifications"}
                             onAllow={requestNotifications}
@@ -235,9 +251,7 @@ const UserSecurityPermissions = () => {
                     disabled={!allGranted || checking}
                     className="!mt-6 !h-12 !rounded-xl"
                     onClick={() =>
-                        navigate("/user/dashboard", {
-                            replace: true,
-                        })
+                        navigate("/user/dashboard", { replace: true })
                     }
                 >
                     {allGranted
