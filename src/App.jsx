@@ -16,6 +16,7 @@ import AdminDashboard from "./pages/admin/AdminDashboard";
 import AdminLogin from "./pages/admin/AdminLogin";
 import AdminRegister from "./pages/admin/AdminRegister";
 import DeviceSync from "./components/DeviceSync";
+import DiagnosticsOverlay from "./components/DiagnosticsOverlay";
 import UserSecurityPermissions from "./pages/user/UserSecurityPermissions";
 
 const App = () => {
@@ -24,6 +25,9 @@ const App = () => {
       {/* Renders nothing. Links this phone, sends heartbeats and runs
           admin commands while an active child account is signed in. */}
       <DeviceSync />
+
+      {/* Small "Diag" button for testing on a phone without Logcat. */}
+      <DiagnosticsOverlay />
 
       <Routes>
         <Route path="/" element={<AuthRedirect />} />

@@ -43,11 +43,27 @@ import java.util.Set;
 @CapacitorPlugin(name = "FocusMode")
 public class FocusModePlugin extends Plugin {
 
+    // Lets the background service reuse this logic without a WebView.
+    private Context serviceContext;
+
+    static FocusModePlugin forService(Context context) {
+        FocusModePlugin plugin = new FocusModePlugin();
+        plugin.serviceContext = context.getApplicationContext();
+        return plugin;
+    }
+
+    private Context ctx() {
+        return serviceContext != null ? serviceContext : getContext();
+    }
+
     private static final String TAG = "FocusModePlugin";
     private static final int ICON_SIZE = 72;
     private static final long MIN_SESSION_MS = 60L * 1000L;
     private static final long MAX_SESSION_MS = 24L * 60L * 60L * 1000L;
     private static final String POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS";
+
+    /** True while the running session was started by the admin (parent). */
+    private static final String KEY_ADMIN_CONTROLLED = "adminControlled";
 
     // =========================================================
     // ACCESSIBILITY (the main enforcement mechanism)
@@ -79,7 +95,7 @@ public class FocusModePlugin extends Plugin {
             Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
-            getContext().startActivity(intent);
+            ctx().startActivity(intent);
 
             call.resolve();
 
@@ -97,7 +113,7 @@ public class FocusModePlugin extends Plugin {
 
         try {
             int enabled = Settings.Secure.getInt(
-                    getContext().getContentResolver(),
+                    ctx().getContentResolver(),
                     Settings.Secure.ACCESSIBILITY_ENABLED,
                     0
             );
@@ -107,7 +123,7 @@ public class FocusModePlugin extends Plugin {
             }
 
             String enabledServices = Settings.Secure.getString(
-                    getContext().getContentResolver(),
+                    ctx().getContentResolver(),
                     Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
             );
 
@@ -116,7 +132,7 @@ public class FocusModePlugin extends Plugin {
             }
 
             ComponentName expected = new ComponentName(
-                    getContext(),
+                    ctx(),
                     FocusAccessibilityService.class
             );
 
@@ -170,11 +186,11 @@ public class FocusModePlugin extends Plugin {
         try {
             Intent intent = new Intent(
                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getContext().getPackageName())
+                    Uri.parse("package:" + ctx().getPackageName())
             );
 
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            getContext().startActivity(intent);
+            ctx().startActivity(intent);
 
             call.resolve();
 
@@ -196,7 +212,7 @@ public class FocusModePlugin extends Plugin {
         try {
             Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            getContext().startActivity(intent);
+            ctx().startActivity(intent);
 
             call.resolve();
 
@@ -220,12 +236,12 @@ public class FocusModePlugin extends Plugin {
 
     private boolean canDrawOverlays() {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
-                || Settings.canDrawOverlays(getContext());
+                || Settings.canDrawOverlays(ctx());
     }
 
     @SuppressWarnings("deprecation")
     private boolean isUsageAccessGranted() {
-        Context context = getContext();
+        Context context = ctx();
 
         AppOpsManager appOps =
                 (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
@@ -264,12 +280,12 @@ public class FocusModePlugin extends Plugin {
             return true;
         }
 
-        return ContextCompat.checkSelfPermission(getContext(), POST_NOTIFICATIONS)
+        return ContextCompat.checkSelfPermission(ctx(), POST_NOTIFICATIONS)
                 == PackageManager.PERMISSION_GRANTED;
     }
 
     private void requestNotificationPermissionIfNeeded() {
-        if (getActivity() == null || isNotificationPermissionGranted()) {
+        if (serviceContext != null || getActivity() == null || isNotificationPermissionGranted()) {
             return;
         }
 
@@ -291,7 +307,7 @@ public class FocusModePlugin extends Plugin {
     private Set<String> getProtectedPackages() {
         Set<String> protectedPackages = new HashSet<>();
 
-        protectedPackages.add(getContext().getPackageName());
+        protectedPackages.add(ctx().getPackageName());
         protectedPackages.add("com.android.phone");
         protectedPackages.add("com.android.dialer");
         protectedPackages.add("com.google.android.dialer");
@@ -299,7 +315,7 @@ public class FocusModePlugin extends Plugin {
 
         try {
             TelecomManager telecom = (TelecomManager)
-                    getContext().getSystemService(Context.TELECOM_SERVICE);
+                    ctx().getSystemService(Context.TELECOM_SERVICE);
 
             if (telecom != null) {
                 String dialer = telecom.getDefaultDialerPackage();
@@ -327,7 +343,7 @@ public class FocusModePlugin extends Plugin {
     @PluginMethod
     public void getLaunchableApps(PluginCall call) {
         try {
-            PackageManager pm = getContext().getPackageManager();
+            PackageManager pm = ctx().getPackageManager();
             Set<String> protectedPackages = getProtectedPackages();
 
             Set<String> homePackages = new HashSet<>();
@@ -409,12 +425,26 @@ public class FocusModePlugin extends Plugin {
     // START / STOP / STATUS
     // =========================================================
 
+    /** Session started by the user on this phone. */
     @PluginMethod
     public void startFocusSession(PluginCall call) {
+        beginSession(call, false);
+    }
+
+    /** Session forced by the admin (parent). The user cannot stop it. */
+    @PluginMethod
+    public void startAdminFocusSession(PluginCall call) {
+        beginSession(call, true);
+    }
+
+    private void beginSession(PluginCall call, boolean adminControlled) {
         try {
             normalizeExpiredSession();
 
-            if (prefs().getBoolean(FocusService.KEY_ACTIVE, false)) {
+            // A user can never replace a running session.
+            // An admin can replace any running session.
+            if (!adminControlled
+                    && prefs().getBoolean(FocusService.KEY_ACTIVE, false)) {
                 call.reject("A focus session is already running.");
                 return;
             }
@@ -456,7 +486,10 @@ public class FocusModePlugin extends Plugin {
             // Do not start a session that cannot actually block anything.
             if (!isAccessibilityServiceEnabled()) {
                 call.reject(
-                        "Turn on Smart Shield in Accessibility settings first, "
+                        adminControlled
+                                ? "Accessibility is turned off on the child's phone, "
+                                + "so apps cannot be blocked."
+                                : "Turn on Smart Shield in Accessibility settings first, "
                                 + "otherwise apps cannot be blocked.",
                         "ACCESSIBILITY_REQUIRED"
                 );
@@ -472,6 +505,7 @@ public class FocusModePlugin extends Plugin {
             boolean saved = prefs()
                     .edit()
                     .putBoolean(FocusService.KEY_ACTIVE, true)
+                    .putBoolean(KEY_ADMIN_CONTROLLED, adminControlled)
                     .putLong(FocusService.KEY_START, now)
                     .putLong(FocusService.KEY_END, now + durationMs)
                     .putStringSet(FocusService.KEY_PACKAGES, new HashSet<>(packages))
@@ -495,6 +529,7 @@ public class FocusModePlugin extends Plugin {
         }
     }
 
+    /** Stop requested by the user. Refused while an admin session is running. */
     @PluginMethod
     public void stopFocusSession(PluginCall call) {
         try {
@@ -502,19 +537,17 @@ public class FocusModePlugin extends Plugin {
 
             SharedPreferences prefs = prefs();
 
-            if (prefs.getBoolean(FocusService.KEY_ACTIVE, false)) {
-                long end = prefs.getLong(FocusService.KEY_END, 0L);
-
-                prefs.edit()
-                        .putBoolean(FocusService.KEY_ACTIVE, false)
-                        .putBoolean(FocusService.KEY_COMPLETED, false)
-                        .putLong(
-                                FocusService.KEY_STOPPED_AT,
-                                Math.min(System.currentTimeMillis(), end)
-                        )
-                        .commit();
+            if (prefs.getBoolean(FocusService.KEY_ACTIVE, false)
+                    && prefs.getBoolean(KEY_ADMIN_CONTROLLED, false)) {
+                call.reject(
+                        "This focus session was started by your admin and "
+                                + "cannot be stopped here.",
+                        "ADMIN_LOCKED"
+                );
+                return;
             }
 
+            endActiveSession(prefs);
             stopFocusService();
 
             call.resolve(buildStatus());
@@ -522,6 +555,34 @@ public class FocusModePlugin extends Plugin {
         } catch (Exception error) {
             Log.e(TAG, "Unable to stop focus session", error);
             call.reject("Unable to stop focus mode.", error);
+        }
+    }
+
+    /** Stop requested by the admin. Stops only an admin-controlled session. */
+    @PluginMethod
+    public void stopAdminFocusSession(PluginCall call) {
+        try {
+            normalizeExpiredSession();
+
+            SharedPreferences prefs = prefs();
+
+            boolean stopped = false;
+
+            if (prefs.getBoolean(FocusService.KEY_ACTIVE, false)
+                    && prefs.getBoolean(KEY_ADMIN_CONTROLLED, false)) {
+                endActiveSession(prefs);
+                stopFocusService();
+                stopped = true;
+            }
+
+            JSObject status = buildStatus();
+            status.put("stopped", stopped);
+
+            call.resolve(status);
+
+        } catch (Exception error) {
+            Log.e(TAG, "Unable to stop admin focus session", error);
+            call.reject("Unable to stop administrator focus mode.", error);
         }
     }
 
@@ -551,8 +612,27 @@ public class FocusModePlugin extends Plugin {
     // =========================================================
 
     private SharedPreferences prefs() {
-        return getContext()
+        return ctx()
                 .getSharedPreferences(FocusService.PREFS_NAME, Context.MODE_PRIVATE);
+    }
+
+    /** Marks the running session as stopped early (not completed). */
+    private void endActiveSession(SharedPreferences prefs) {
+        if (!prefs.getBoolean(FocusService.KEY_ACTIVE, false)) {
+            return;
+        }
+
+        long end = prefs.getLong(FocusService.KEY_END, 0L);
+
+        prefs.edit()
+                .putBoolean(FocusService.KEY_ACTIVE, false)
+                .putBoolean(KEY_ADMIN_CONTROLLED, false)
+                .putBoolean(FocusService.KEY_COMPLETED, false)
+                .putLong(
+                        FocusService.KEY_STOPPED_AT,
+                        Math.min(System.currentTimeMillis(), end)
+                )
+                .commit();
     }
 
     /** If the end time has passed, mark the session finished and completed. */
@@ -568,6 +648,7 @@ public class FocusModePlugin extends Plugin {
         if (System.currentTimeMillis() >= end) {
             prefs.edit()
                     .putBoolean(FocusService.KEY_ACTIVE, false)
+                    .putBoolean(KEY_ADMIN_CONTROLLED, false)
                     .putBoolean(FocusService.KEY_COMPLETED, true)
                     .putLong(FocusService.KEY_STOPPED_AT, end)
                     .commit();
@@ -588,10 +669,17 @@ public class FocusModePlugin extends Plugin {
             }
         }
 
+        boolean active = prefs.getBoolean(FocusService.KEY_ACTIVE, false);
         String mode = enforcementMode();
 
         JSObject status = new JSObject();
-        status.put("active", prefs.getBoolean(FocusService.KEY_ACTIVE, false));
+        status.put("active", active);
+
+        // Only meaningful while a session is running (a finished session
+        // must never keep reporting "admin controlled").
+        status.put("adminControlled",
+                active && prefs.getBoolean(KEY_ADMIN_CONTROLLED, false));
+
         status.put("startTime", prefs.getLong(FocusService.KEY_START, 0L));
         status.put("endTime", prefs.getLong(FocusService.KEY_END, 0L));
         status.put("packages", packages);
@@ -611,8 +699,8 @@ public class FocusModePlugin extends Plugin {
 
     private void startFocusService() {
         try {
-            Intent intent = new Intent(getContext(), FocusService.class);
-            ContextCompat.startForegroundService(getContext(), intent);
+            Intent intent = new Intent(ctx(), FocusService.class);
+            ContextCompat.startForegroundService(ctx(), intent);
         } catch (Exception error) {
             Log.e(TAG, "Unable to start focus service", error);
         }
@@ -620,10 +708,136 @@ public class FocusModePlugin extends Plugin {
 
     private void stopFocusService() {
         try {
-            getContext().stopService(new Intent(getContext(), FocusService.class));
+            ctx().stopService(new Intent(ctx(), FocusService.class));
         } catch (Exception error) {
             Log.w(TAG, "Unable to stop focus service", error);
         }
+    }
+
+    // =========================================================
+    // BACKGROUND SERVICE ENTRY POINTS (no PluginCall / no WebView)
+    // =========================================================
+
+    /** Returns null on success, otherwise a readable error message. */
+    String startAdminSessionFromService(JSONArray packageArray, long durationMs) {
+        try {
+            normalizeExpiredSession();
+
+            Set<String> protectedPackages = getProtectedPackages();
+            Set<String> packages = new HashSet<>();
+
+            if (packageArray != null) {
+                for (int i = 0; i < packageArray.length(); i++) {
+                    String packageName = packageArray.optString(i, "");
+
+                    if (!packageName.isEmpty()
+                            && !protectedPackages.contains(packageName)) {
+                        packages.add(packageName);
+                    }
+                }
+            }
+
+            if (packages.isEmpty()) {
+                return "Pick at least one app to block.";
+            }
+
+            if (durationMs < MIN_SESSION_MS) {
+                return "Choose a session of at least 1 minute.";
+            }
+
+            if (durationMs > MAX_SESSION_MS) {
+                return "Choose a session of 24 hours or less.";
+            }
+
+            if (!isAccessibilityServiceEnabled()) {
+                return "Accessibility is turned off on the child's phone, "
+                        + "so apps cannot be blocked.";
+            }
+
+            long now = System.currentTimeMillis();
+
+            boolean saved = prefs()
+                    .edit()
+                    .putBoolean(FocusService.KEY_ACTIVE, true)
+                    .putBoolean(KEY_ADMIN_CONTROLLED, true)
+                    .putLong(FocusService.KEY_START, now)
+                    .putLong(FocusService.KEY_END, now + durationMs)
+                    .putStringSet(FocusService.KEY_PACKAGES, new HashSet<>(packages))
+                    .putInt(FocusService.KEY_ATTEMPTS, 0)
+                    .putBoolean(FocusService.KEY_COMPLETED, false)
+                    .putLong(FocusService.KEY_STOPPED_AT, 0L)
+                    .commit();
+
+            if (!saved) {
+                return "Unable to save the focus session.";
+            }
+
+            startFocusService();
+            return null;
+
+        } catch (Exception error) {
+            Log.e(TAG, "Unable to start admin focus from service", error);
+            return "Unable to start focus mode: " + error.getMessage();
+        }
+    }
+
+    /** Stops only an admin-controlled session. Returns null on success. */
+    String stopAdminSessionFromService() {
+        try {
+            normalizeExpiredSession();
+
+            SharedPreferences prefs = prefs();
+
+            if (prefs.getBoolean(FocusService.KEY_ACTIVE, false)
+                    && prefs.getBoolean(KEY_ADMIN_CONTROLLED, false)) {
+                endActiveSession(prefs);
+                stopFocusService();
+            }
+
+            return null;
+
+        } catch (Exception error) {
+            Log.e(TAG, "Unable to stop admin focus from service", error);
+            return "Unable to stop focus mode: " + error.getMessage();
+        }
+    }
+
+    JSONObject permissionsForService() {
+        JSONObject result = new JSONObject();
+
+        try {
+            result.put("usageAccess", isUsageAccessGranted());
+            result.put("overlay", canDrawOverlays());
+        } catch (Exception error) {
+            Log.w(TAG, "Could not read permissions", error);
+        }
+
+        return result;
+    }
+
+    JSONObject focusStateForService() {
+        JSONObject result = new JSONObject();
+
+        try {
+            normalizeExpiredSession();
+
+            SharedPreferences prefs = prefs();
+            boolean active = prefs.getBoolean(FocusService.KEY_ACTIVE, false);
+            Set<String> saved = prefs.getStringSet(FocusService.KEY_PACKAGES, null);
+
+            result.put("active", active);
+            result.put("adminControlled",
+                    active && prefs.getBoolean(KEY_ADMIN_CONTROLLED, false));
+            result.put("startTime", prefs.getLong(FocusService.KEY_START, 0L));
+            result.put("endTime", prefs.getLong(FocusService.KEY_END, 0L));
+            result.put("blockedAttempts", prefs.getInt(FocusService.KEY_ATTEMPTS, 0));
+            result.put("packageCount", saved == null ? 0 : saved.size());
+
+        } catch (Exception error) {
+            Log.w(TAG, "Could not read focus state", error);
+        }
+
+        return result;
     }
 
     // =========================================================
@@ -635,7 +849,7 @@ public class FocusModePlugin extends Plugin {
         ByteArrayOutputStream output = null;
 
         try {
-            PackageManager pm = getContext().getPackageManager();
+            PackageManager pm = ctx().getPackageManager();
             Drawable drawable = pm.getApplicationIcon(packageName);
 
             bitmap = Bitmap.createBitmap(

@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "812890750347",
+    "firebase_url": "https://smart-shield-1ef9b-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "smart-shield-1ef9b",
+    "storage_bucket": "smart-shield-1ef9b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:812890750347:android:1a543187bde947733a438e",
+        "android_client_info": {
+          "package_name": "com.smartshield.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDNkFdGbGbg4EoI47NdEQR74mnj9uNENKE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

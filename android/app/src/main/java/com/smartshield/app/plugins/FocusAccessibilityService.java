@@ -1,4 +1,3 @@
-
 package com.smartshield.app.plugins;
 
 import android.accessibilityservice.AccessibilityService;
@@ -28,11 +27,25 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
+/**
+ * Smart Shield focus-mode enforcement.
+ *
+ * Design rules:
+ *  - Decide from the CURRENT set of visible app windows, not from a single
+ *    event. A stray event from another window (system popup, keyboard,
+ *    manufacturer service) must never uncover a blocked app.
+ *  - Show the overlay immediately; hide it only after a short re-check
+ *    confirms no blocked app window is visible.
+ *  - If Android cannot tell us what is on screen (empty or unreadable
+ *    window list), keep the current state instead of guessing.
+ *  - All session state lives in the "smartshield_focus" SharedPreferences,
+ *    so the service can restore itself after a reconnect or reboot.
+ */
 public class FocusAccessibilityService extends AccessibilityService {
 
     private static final String TAG = "FocusAccessibility";
 
-    // SharedPreferences used by FocusModePlugin and FocusService.
+    // Same file and keys as FocusModePlugin / FocusService.
     private static final String PREFS_NAME = "smartshield_focus";
     private static final String KEY_ACTIVE = "active";
     private static final String KEY_END = "endTime";
@@ -45,51 +58,43 @@ public class FocusAccessibilityService extends AccessibilityService {
     private static final long HIDE_CONFIRM_MS = 400L;
     private static final long EXPIRY_MARGIN_MS = 100L;
 
-    /**
-     * True while Android has connected this Accessibility Service.
-     * Read by FocusModePlugin.
-     */
+    /** True while Android has this service connected (used by the plugin). */
     public static volatile boolean connected = false;
 
     private Handler handler;
     private WindowManager windowManager;
 
-    private View blockingView;
-    private TextView appText;
-    private TextView timerText;
+    private View blockingView = null;
+    private TextView appText = null;
+    private TextView timerText = null;
 
-    private String currentBlockedPackage;
-
+    private String currentBlockedPackage = null;
     private boolean overlayVisible = false;
     private boolean hidePending = false;
 
-    // Result of checking currently visible application windows.
+    /** Result of looking at the windows currently on screen. */
     private static final class Scan {
-        boolean windowsKnown = false;
-        boolean unreadable = false;
-        String blockedPackage = null;
+        boolean windowsKnown = false;   // Android gave us a usable window list
+        boolean unreadable = false;     // an app window exists but cannot be read
+        String blockedPackage = null;   // a visible blocked app, if any
     }
 
     // =========================================================
-    // TIMER
+    // CALLBACKS
     // =========================================================
 
     private final Runnable timerRunnable = new Runnable() {
         @Override
         public void run() {
-            if (!overlayVisible || handler == null) {
+            if (!overlayVisible) {
                 return;
             }
 
-            SharedPreferences preferences = prefs();
+            SharedPreferences prefs = prefs();
+            long remaining = prefs.getLong(KEY_END, 0L) - System.currentTimeMillis();
 
-            long remaining =
-                    preferences.getLong(KEY_END, 0L)
-                            - System.currentTimeMillis();
-
-            if (!preferences.getBoolean(KEY_ACTIVE, false)
-                    || remaining <= 0L) {
-                evaluate(null, false);
+            if (!prefs.getBoolean(KEY_ACTIVE, false) || remaining <= 0L) {
+                evaluate(null, false); // finishes the session / hides the overlay
                 return;
             }
 
@@ -117,17 +122,16 @@ public class FocusAccessibilityService extends AccessibilityService {
                 return;
             }
 
-            SharedPreferences preferences = prefs();
+            SharedPreferences prefs = prefs();
 
-            if (!preferences.getBoolean(KEY_ACTIVE, false)) {
+            if (!prefs.getBoolean(KEY_ACTIVE, false)) {
                 hideNow();
                 return;
             }
 
-            Scan scan = scanWindows(loadBlockedPackages(preferences));
+            Scan scan = scanWindows(loadBlockedPackages(prefs));
 
-            // Hide only when Android gives us a readable window list
-            // and no blocked application is visible.
+            // Hide only when we are sure no blocked app is on screen.
             if (scan.blockedPackage == null
                     && scan.windowsKnown
                     && !scan.unreadable) {
@@ -137,7 +141,7 @@ public class FocusAccessibilityService extends AccessibilityService {
     };
 
     // =========================================================
-    // SERVICE LIFECYCLE
+    // LIFECYCLE
     // =========================================================
 
     @Override
@@ -145,15 +149,14 @@ public class FocusAccessibilityService extends AccessibilityService {
         super.onServiceConnected();
 
         handler = new Handler(Looper.getMainLooper());
-
-        windowManager = (WindowManager)
-                getSystemService(Context.WINDOW_SERVICE);
+        windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
 
         connected = true;
 
         Log.i(TAG, "Accessibility service connected");
 
-        // Restore an existing focus session after reconnection.
+        // Restore enforcement for a session that is already running
+        // (reconnect after the user re-enabled the service, or after reboot).
         evaluate(null, false);
     }
 
@@ -182,36 +185,30 @@ public class FocusAccessibilityService extends AccessibilityService {
 
         hideNow();
 
-        Log.i(TAG, "Accessibility service destroyed");
-
         super.onDestroy();
     }
 
     @Override
     public void onInterrupt() {
-        // Do not change blocking state just because Android interrupts
-        // accessibility feedback.
-        Log.i(TAG, "Accessibility service interrupted");
+        // Android asks us to stop accessibility feedback. This says nothing
+        // about which app is on screen, so the overlay must stay as it is.
+        Log.i(TAG, "onInterrupt (ignored)");
     }
 
     // =========================================================
-    // ACCESSIBILITY EVENTS
+    // EVENTS
     // =========================================================
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-
         if (event == null || handler == null) {
             return;
         }
 
         int type = event.getEventType();
 
-        boolean windowState =
-                type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
-
-        boolean windowsChanged =
-                type == AccessibilityEvent.TYPE_WINDOWS_CHANGED;
+        boolean windowState = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+        boolean windowsChanged = type == AccessibilityEvent.TYPE_WINDOWS_CHANGED;
 
         if (!windowState && !windowsChanged) {
             return;
@@ -227,63 +224,56 @@ public class FocusAccessibilityService extends AccessibilityService {
     }
 
     // =========================================================
-    // CORE ENFORCEMENT
+    // CORE DECISION
     // =========================================================
 
+    /**
+     * @param eventPackage package of a window-state event, or null
+     * @param fromWindowState true when eventPackage came from a window-state event
+     */
     private void evaluate(String eventPackage, boolean fromWindowState) {
+        SharedPreferences prefs = prefs();
 
-        if (handler == null) {
-            return;
-        }
-
-        SharedPreferences preferences = prefs();
-
-        if (!preferences.getBoolean(KEY_ACTIVE, false)) {
+        if (!prefs.getBoolean(KEY_ACTIVE, false)) {
             hideNow();
             return;
         }
 
         long now = System.currentTimeMillis();
-        long end = preferences.getLong(KEY_END, 0L);
+        long end = prefs.getLong(KEY_END, 0L);
 
         if (now >= end) {
-            completeSession(preferences, end);
+            completeSession(prefs, end);
             hideNow();
             return;
         }
 
         scheduleExpiry(end - now);
 
-        Set<String> blockedPackages =
-                loadBlockedPackages(preferences);
+        Set<String> blocked = loadBlockedPackages(prefs);
 
-        if (blockedPackages.isEmpty()) {
+        if (blocked.isEmpty()) {
             hideNow();
             return;
         }
 
-        Scan scan = scanWindows(blockedPackages);
+        Scan scan = scanWindows(blocked);
 
         String target = scan.blockedPackage;
 
-        // A window-state event can identify a blocked app before
-        // Android exposes its window in getWindows().
+        // Window list missed it (not drawn yet / unreadable): trust the event.
         if (target == null
                 && fromWindowState
                 && eventPackage != null
-                && blockedPackages.contains(eventPackage)) {
-
+                && blocked.contains(eventPackage)) {
             target = eventPackage;
         }
 
         if (target != null) {
-
             cancelPendingHide();
-
             showOrUpdateOverlay(target);
 
-            // Recheck if the blocked package was detected only
-            // from the event rather than the visible window list.
+            // Shown only because of the event: re-check shortly.
             if (scan.blockedPackage == null) {
                 scheduleHideConfirm();
             }
@@ -291,22 +281,16 @@ public class FocusAccessibilityService extends AccessibilityService {
             return;
         }
 
-        // Do not hide when the window information is incomplete.
         if (overlayVisible
                 && scan.windowsKnown
                 && !scan.unreadable) {
-
             scheduleHideConfirm();
         }
     }
 
-    // =========================================================
-    // VISIBLE WINDOW SCANNING
-    // =========================================================
-
+    /** Looks at the app windows that are currently visible on screen. */
     @SuppressWarnings("deprecation")
-    private Scan scanWindows(Set<String> blockedPackages) {
-
+    private Scan scanWindows(Set<String> blocked) {
         Scan scan = new Scan();
 
         List<AccessibilityWindowInfo> windows;
@@ -314,7 +298,7 @@ public class FocusAccessibilityService extends AccessibilityService {
         try {
             windows = getWindows();
         } catch (Exception error) {
-            Log.w(TAG, "Unable to read accessibility windows", error);
+            Log.w(TAG, "getWindows failed", error);
             return scan;
         }
 
@@ -325,146 +309,96 @@ public class FocusAccessibilityService extends AccessibilityService {
         scan.windowsKnown = true;
 
         for (AccessibilityWindowInfo window : windows) {
-
             if (window == null) {
                 continue;
             }
 
-            AccessibilityNodeInfo root = null;
-
-            try {
-
-                if (window.getType()
-                        != AccessibilityWindowInfo.TYPE_APPLICATION) {
-                    continue;
-                }
-
-                root = window.getRoot();
-
-                if (root == null || root.getPackageName() == null) {
-                    scan.unreadable = true;
-                    continue;
-                }
-
-                String packageName =
-                        root.getPackageName().toString();
-
-                if (blockedPackages.contains(packageName)) {
-                    scan.blockedPackage = packageName;
-                    break;
-                }
-
-            } catch (Exception error) {
-
-                scan.unreadable = true;
-
-                Log.w(TAG, "Unable to inspect an application window", error);
-
-            } finally {
-
-                if (root != null) {
-                    root.recycle();
-                }
+            if (window.getType() == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                AccessibilityNodeInfo root = null;
 
                 try {
-                    window.recycle();
-                } catch (Exception ignored) {
-                    // Window may already have been released.
+                    root = window.getRoot();
+
+                    if (root == null || root.getPackageName() == null) {
+                        scan.unreadable = true;
+                    } else {
+                        String packageName = root.getPackageName().toString();
+
+                        if (scan.blockedPackage == null
+                                && blocked.contains(packageName)) {
+                            scan.blockedPackage = packageName;
+                        }
+                    }
+                } catch (Exception error) {
+                    scan.unreadable = true;
+                } finally {
+                    if (root != null) {
+                        root.recycle();
+                    }
                 }
             }
+
+            window.recycle();
         }
 
         return scan;
     }
 
-    // =========================================================
-    // SESSION COMPLETION
-    // =========================================================
-
-    private void completeSession(
-            SharedPreferences preferences,
-            long end
-    ) {
-
-        if (!preferences.getBoolean(KEY_ACTIVE, false)) {
+    private void completeSession(SharedPreferences prefs, long end) {
+        if (!prefs.getBoolean(KEY_ACTIVE, false)) {
             return;
         }
 
-        preferences.edit()
+        prefs.edit()
                 .putBoolean(KEY_ACTIVE, false)
                 .putBoolean(KEY_COMPLETED, true)
                 .putLong(KEY_STOPPED_AT, end)
                 .apply();
 
-        Log.i(TAG, "Focus session completed");
+        Log.i(TAG, "Focus session finished");
     }
 
     private void scheduleExpiry(long remainingMs) {
-
-        if (handler == null) {
-            return;
-        }
-
         handler.removeCallbacks(expiryRunnable);
-
-        handler.postDelayed(
-                expiryRunnable,
-                Math.max(0L, remainingMs) + EXPIRY_MARGIN_MS
-        );
+        handler.postDelayed(expiryRunnable, remainingMs + EXPIRY_MARGIN_MS);
     }
 
     private void scheduleHideConfirm() {
-
-        if (handler == null || hidePending) {
+        if (hidePending) {
             return;
         }
 
         hidePending = true;
-
-        handler.postDelayed(
-                confirmHideRunnable,
-                HIDE_CONFIRM_MS
-        );
+        handler.postDelayed(confirmHideRunnable, HIDE_CONFIRM_MS);
     }
 
     private void cancelPendingHide() {
-
         hidePending = false;
-
-        if (handler != null) {
-            handler.removeCallbacks(confirmHideRunnable);
-        }
+        handler.removeCallbacks(confirmHideRunnable);
     }
 
     // =========================================================
-    // BLOCKING OVERLAY
+    // OVERLAY
     // =========================================================
 
     private void showOrUpdateOverlay(String packageName) {
-
         if (packageName == null || packageName.isEmpty()) {
             return;
         }
 
         if (windowManager == null) {
-            windowManager = (WindowManager)
-                    getSystemService(Context.WINDOW_SERVICE);
+            windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         }
 
         if (windowManager == null) {
-            Log.e(TAG, "WindowManager unavailable");
             return;
         }
 
-        // Update the current overlay instead of creating duplicates.
+        // Already showing: only refresh the text if the blocked app changed.
         if (overlayVisible && blockingView != null) {
-
             if (!packageName.equals(currentBlockedPackage)) {
-
                 currentBlockedPackage = packageName;
-
                 updateAppText(packageName);
-
                 countAttempt();
             }
 
@@ -474,56 +408,37 @@ public class FocusAccessibilityService extends AccessibilityService {
         View view = buildBlockingView(packageName);
 
         try {
-
-            windowManager.addView(
-                    view,
-                    createLayoutParams()
-            );
-
+            windowManager.addView(view, createLayoutParams());
         } catch (Exception error) {
-
             Log.e(TAG, "Unable to display blocking overlay", error);
-
             blockingView = null;
             appText = null;
             timerText = null;
-
-            overlayVisible = false;
-
             return;
         }
 
         blockingView = view;
-
         currentBlockedPackage = packageName;
-
         overlayVisible = true;
 
         countAttempt();
 
-        if (handler != null) {
-            handler.removeCallbacks(timerRunnable);
-            handler.post(timerRunnable);
-        }
+        handler.removeCallbacks(timerRunnable);
+        handler.post(timerRunnable);
 
-        Log.i(TAG, "Blocking application: " + packageName);
+        Log.i(TAG, "Blocking: " + packageName);
     }
 
     private void countAttempt() {
+        SharedPreferences prefs = prefs();
 
-        SharedPreferences preferences = prefs();
-
-        int attempts = preferences.getInt(KEY_ATTEMPTS, 0);
-
-        preferences.edit()
-                .putInt(KEY_ATTEMPTS, attempts + 1)
+        prefs.edit()
+                .putInt(KEY_ATTEMPTS, prefs.getInt(KEY_ATTEMPTS, 0) + 1)
                 .apply();
     }
 
     private void updateAppText(String packageName) {
-
         if (appText != null) {
-
             appText.setText(
                     getApplicationLabel(packageName)
                             + " is restricted during this session."
@@ -532,7 +447,6 @@ public class FocusAccessibilityService extends AccessibilityService {
     }
 
     private void hideNow() {
-
         if (handler != null) {
             handler.removeCallbacks(timerRunnable);
             handler.removeCallbacks(confirmHideRunnable);
@@ -541,148 +455,83 @@ public class FocusAccessibilityService extends AccessibilityService {
         hidePending = false;
 
         if (blockingView != null && windowManager != null) {
-
             try {
                 windowManager.removeView(blockingView);
-
             } catch (Exception error) {
-
-                Log.w(TAG, "Overlay was already removed", error);
+                Log.w(TAG, "Overlay already removed", error);
             }
         }
 
         blockingView = null;
         appText = null;
         timerText = null;
-
         currentBlockedPackage = null;
-
         overlayVisible = false;
     }
 
-    // =========================================================
-    // WINDOW LAYOUT
-    // =========================================================
-
     private WindowManager.LayoutParams createLayoutParams() {
-
-        WindowManager.LayoutParams params =
-                new WindowManager.LayoutParams(
-                        WindowManager.LayoutParams.MATCH_PARENT,
-                        WindowManager.LayoutParams.MATCH_PARENT,
-                        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                                | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                        PixelFormat.OPAQUE
-                );
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.OPAQUE
+        );
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-
             params.layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams
-                            .LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         }
 
         return params;
     }
 
-    // =========================================================
-    // BLOCKING SCREEN UI
-    // =========================================================
-
     private View buildBlockingView(String packageName) {
-
         LinearLayout root = new LinearLayout(this);
 
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER);
-
-        root.setPadding(
-                dp(28),
-                dp(28),
-                dp(28),
-                dp(28)
-        );
-
+        root.setPadding(dp(28), dp(28), dp(28), dp(28));
         root.setBackgroundColor(Color.rgb(15, 23, 42));
-        root.setClickable(true);
+        root.setClickable(true); // swallow touches
 
-        TextView badge = makeText(
-                "SMART SHIELD \u2022 FOCUS MODE",
-                12,
-                "#60A5FA",
-                true
-        );
-
+        TextView badge = makeText("SMART SHIELD \u2022 FOCUS MODE", 12, "#60A5FA", true);
         badge.setLetterSpacing(0.12f);
-
         root.addView(badge, wrapParams(0));
 
-        TextView title = makeText(
-                "Take a mindful break",
-                27,
-                "#FFFFFF",
-                true
-        );
-
+        TextView title = makeText("Take a mindful break", 27, "#FFFFFF", true);
         root.addView(title, wrapParams(24));
 
         appText = makeText(
                 getApplicationLabel(packageName)
                         + " is restricted during this session.",
-                16,
-                "#CBD5E1",
-                false
+                16, "#CBD5E1", false
         );
-
         root.addView(appText, wrapParams(14));
 
         timerText = makeText(
-                formatTime(
-                        prefs().getLong(KEY_END, 0L)
-                                - System.currentTimeMillis()
-                ),
-                52,
-                "#FFFFFF",
-                true
+                formatTime(prefs().getLong(KEY_END, 0L) - System.currentTimeMillis()),
+                52, "#FFFFFF", true
         );
-
         root.addView(timerText, wrapParams(30));
 
         TextView caption = makeText(
-                "remaining in your focus session",
-                13,
-                "#94A3B8",
-                false
+                "remaining in your focus session", 13, "#94A3B8", false
         );
-
         root.addView(caption, wrapParams(5));
 
-        TextView button = makeText(
-                "Return to home screen",
-                16,
-                "#0F172A",
-                true
-        );
-
-        button.setPadding(
-                dp(26),
-                dp(15),
-                dp(26),
-                dp(15)
-        );
+        TextView button = makeText("Return to home screen", 16, "#0F172A", true);
+        button.setPadding(dp(26), dp(15), dp(26), dp(15));
 
         GradientDrawable background = new GradientDrawable();
-
         background.setColor(Color.WHITE);
         background.setCornerRadius(dp(30));
 
         button.setBackground(background);
         button.setClickable(true);
-
         button.setOnClickListener(new View.OnClickListener() {
-
             @Override
             public void onClick(View view) {
                 performGlobalAction(GLOBAL_ACTION_HOME);
@@ -699,27 +548,18 @@ public class FocusAccessibilityService extends AccessibilityService {
     // =========================================================
 
     private SharedPreferences prefs() {
-
-        return getSharedPreferences(
-                PREFS_NAME,
-                MODE_PRIVATE
-        );
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
     }
 
-    private Set<String> loadBlockedPackages(
-            SharedPreferences preferences
-    ) {
-
+    private Set<String> loadBlockedPackages(SharedPreferences prefs) {
         Set<String> blocked = new HashSet<>();
-
-        Set<String> saved =
-                preferences.getStringSet(KEY_PACKAGES, null);
+        Set<String> saved = prefs.getStringSet(KEY_PACKAGES, null);
 
         if (saved != null) {
             blocked.addAll(saved);
         }
 
-        // Never block Smart Shield or Android System UI.
+        // Never block ourselves or the system UI.
         blocked.remove(getPackageName());
         blocked.remove("com.android.systemui");
 
@@ -727,95 +567,57 @@ public class FocusAccessibilityService extends AccessibilityService {
     }
 
     private String getApplicationLabel(String packageName) {
-
         try {
+            CharSequence label = getPackageManager().getApplicationLabel(
+                    getPackageManager().getApplicationInfo(packageName, 0)
+            );
 
-            CharSequence label =
-                    getPackageManager().getApplicationLabel(
-                            getPackageManager().getApplicationInfo(
-                                    packageName,
-                                    0
-                            )
-                    );
-
-            return label == null
-                    ? packageName
-                    : label.toString();
+            return label == null ? packageName : label.toString();
 
         } catch (Exception error) {
-
             return packageName;
         }
     }
 
     private String formatTime(long milliseconds) {
-
-        long seconds = Math.max(
-                0L,
-                (milliseconds + 999L) / 1000L
-        );
+        long seconds = Math.max(0L, (milliseconds + 999L) / 1000L);
 
         long hours = seconds / 3600L;
         long minutes = (seconds % 3600L) / 60L;
         long remainingSeconds = seconds % 60L;
 
         if (hours > 0) {
-
             return String.format(
-                    Locale.getDefault(),
-                    "%d:%02d:%02d",
-                    hours,
-                    minutes,
-                    remainingSeconds
+                    Locale.getDefault(), "%d:%02d:%02d",
+                    hours, minutes, remainingSeconds
             );
         }
 
         return String.format(
-                Locale.getDefault(),
-                "%02d:%02d",
-                minutes,
-                remainingSeconds
+                Locale.getDefault(), "%02d:%02d", minutes, remainingSeconds
         );
     }
 
-    private TextView makeText(
-            String text,
-            float size,
-            String color,
-            boolean bold
-    ) {
-
+    private TextView makeText(String text, float size, String color, boolean bold) {
         TextView view = new TextView(this);
 
         view.setText(text);
-
-        view.setTextSize(
-                TypedValue.COMPLEX_UNIT_SP,
-                size
-        );
-
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, size);
         view.setTextColor(Color.parseColor(color));
         view.setGravity(Gravity.CENTER);
 
         if (bold) {
-            view.setTypeface(
-                    Typeface.DEFAULT,
-                    Typeface.BOLD
-            );
+            view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         }
 
         return view;
     }
 
-    private LinearLayout.LayoutParams wrapParams(
-            int topMarginDp
-    ) {
-
-        LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                );
+    private LinearLayout.LayoutParams wrapParams(int topMarginDp) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
 
         params.gravity = Gravity.CENTER_HORIZONTAL;
         params.topMargin = dp(topMarginDp);
@@ -824,11 +626,6 @@ public class FocusAccessibilityService extends AccessibilityService {
     }
 
     private int dp(float value) {
-
-        return (int) (
-                value * getResources()
-                        .getDisplayMetrics()
-                        .density
-        );
+        return (int) (value * getResources().getDisplayMetrics().density);
     }
 }

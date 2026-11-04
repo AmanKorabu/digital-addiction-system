@@ -1,11 +1,8 @@
+
 import { registerPlugin } from "@capacitor/core";
 
 const FocusMode = registerPlugin("FocusMode");
 
-/**
- * Same result shape as usageStatsService:
- *   { success: true, data, ...data }  or  { success: false, error }
- */
 const run = async (action, fallbackError) => {
     try {
         const data = (await action()) || {};
@@ -23,6 +20,7 @@ export const hasOverlayPermission = () =>
 
 export const openOverlaySettings = () =>
     run(() => FocusMode.openOverlaySettings(), "Unable to open overlay settings.");
+
 export const hasAccessibilityPermission = () =>
     run(
         () => FocusMode.hasAccessibilityPermission(),
@@ -38,21 +36,32 @@ export const openAccessibilitySettings = () =>
 export const getLaunchableApps = () =>
     run(() => FocusMode.getLaunchableApps(), "Unable to load installed apps.");
 
+// Normal user session. Admin control is deliberately not exposed here.
 export const startFocusSession = ({ packages, durationMs }) =>
     run(
         () => FocusMode.startFocusSession({ packages, durationMs }),
         "Unable to start focus mode."
     );
 
+// Normal user stop. Native Android code will reject this for admin-controlled sessions.
 export const stopFocusSession = () =>
     run(() => FocusMode.stopFocusSession(), "Unable to stop focus mode.");
 
+// Reserved for the remote admin-command handler.
+export const startAdminFocusSession = ({ packages, durationMs }) =>
+    run(
+        () => FocusMode.startAdminFocusSession({ packages, durationMs }),
+        "Unable to start administrator focus mode."
+    );
+
+export const stopAdminFocusSession = () =>
+    run(
+        () => FocusMode.stopAdminFocusSession(),
+        "Unable to stop administrator focus mode."
+    );
+
 export const getFocusStatus = () =>
     run(() => FocusMode.getFocusStatus(), "Unable to read focus status.");
-
-// ---------------------------------------------------------
-// Local focus history (kept on the device)
-// ---------------------------------------------------------
 
 const HISTORY_KEY = "smartshield_focus_history";
 const MAX_HISTORY = 200;
@@ -61,14 +70,12 @@ export const loadFocusHistory = () => {
     try {
         const raw = localStorage.getItem(HISTORY_KEY);
         const parsed = raw ? JSON.parse(raw) : [];
-
         return Array.isArray(parsed) ? parsed : [];
     } catch {
         return [];
     }
 };
 
-/** Saves one finished session. Sessions are de-duplicated by `id`. */
 export const saveFocusSession = (session) => {
     const history = loadFocusHistory();
 
@@ -81,7 +88,7 @@ export const saveFocusSession = (session) => {
     try {
         localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
     } catch {
-        // Storage can be unavailable; the in-memory list still works.
+        // Storage may be unavailable.
     }
 
     return next;

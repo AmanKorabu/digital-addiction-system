@@ -43,6 +43,39 @@ import java.util.concurrent.ConcurrentHashMap;
 @CapacitorPlugin(name = "UsageStats")
 public class UsageStatsPlugin extends Plugin {
 
+    // Lets the background service reuse this logic without a WebView.
+    private Context serviceContext;
+
+    static UsageStatsPlugin forService(Context context) {
+        UsageStatsPlugin plugin = new UsageStatsPlugin();
+        plugin.serviceContext = context.getApplicationContext();
+        return plugin;
+    }
+
+    private Context ctx() {
+        return serviceContext != null ? serviceContext : getContext();
+    }
+
+    /**
+     * Today's usage (same numbers the app shows) for the background service.
+     * Returns null when Usage Access is not granted or reading fails.
+     */
+    JSONObject summaryForService() {
+        try {
+            if (!isUsageAccessGranted()) {
+                return null;
+            }
+
+            long now = System.currentTimeMillis();
+
+            return buildUsageResponse(startOfDay(now), now, false);
+
+        } catch (Exception error) {
+            Log.e(TAG, "Unable to build usage summary for service", error);
+            return null;
+        }
+    }
+
     private static final String TAG = "UsageStatsPlugin";
 
     private static final long HOUR_MS = 60L * 60L * 1000L;
@@ -108,7 +141,7 @@ public class UsageStatsPlugin extends Plugin {
         try {
             Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            getContext().startActivity(intent);
+            ctx().startActivity(intent);
             call.resolve();
         } catch (Exception error) {
             Log.e(TAG, "Unable to open Usage Access settings", error);
@@ -134,7 +167,7 @@ public class UsageStatsPlugin extends Plugin {
 
     @SuppressWarnings("deprecation")
     private boolean isUsageAccessGranted() {
-        Context context = getContext();
+        Context context = ctx();
 
         AppOpsManager appOps =
                 (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
@@ -442,7 +475,7 @@ public class UsageStatsPlugin extends Plugin {
 
         try {
             UsageStatsManager manager =
-                    (UsageStatsManager) getContext()
+                    (UsageStatsManager) ctx()
                             .getSystemService(Context.USAGE_STATS_SERVICE);
 
             if (manager == null) {
@@ -821,7 +854,7 @@ public class UsageStatsPlugin extends Plugin {
             return true;
         }
 
-        if (EXCLUDE_OWN_APP && packageName.equals(getContext().getPackageName())) {
+        if (EXCLUDE_OWN_APP && packageName.equals(ctx().getPackageName())) {
             return true;
         }
 
@@ -849,7 +882,7 @@ public class UsageStatsPlugin extends Plugin {
             homeIntent.addCategory(Intent.CATEGORY_HOME);
 
             List<ResolveInfo> resolved =
-                    getContext()
+                    ctx()
                             .getPackageManager()
                             .queryIntentActivities(homeIntent, 0);
 
@@ -875,7 +908,7 @@ public class UsageStatsPlugin extends Plugin {
 
     private String getApplicationName(String packageName) {
         try {
-            PackageManager pm = getContext().getPackageManager();
+            PackageManager pm = ctx().getPackageManager();
             ApplicationInfo info = pm.getApplicationInfo(packageName, 0);
             CharSequence label = pm.getApplicationLabel(info);
 
@@ -905,7 +938,7 @@ public class UsageStatsPlugin extends Plugin {
         ByteArrayOutputStream output = null;
 
         try {
-            PackageManager pm = getContext().getPackageManager();
+            PackageManager pm = ctx().getPackageManager();
             Drawable drawable = pm.getApplicationIcon(packageName);
 
             bitmap = Bitmap.createBitmap(

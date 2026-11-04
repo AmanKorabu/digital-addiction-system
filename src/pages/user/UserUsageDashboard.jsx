@@ -5,7 +5,6 @@ import {
     ClockCircleOutlined,
     AppstoreOutlined,
     SearchOutlined,
-    RightOutlined,
     WarningOutlined,
 } from "@ant-design/icons";
 
@@ -14,6 +13,13 @@ import {
     openUsageAccessSettings,
     getTodayUsage,
 } from "../../services/usageStatsService";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../../config/firebase";
+import {
+    ensureDeviceRegistered,
+    syncDeviceStatus,
+} from "../../services/deviceControlService";
+
 import BottomNavigation from "../../components/user/BottomNavigation";
 
 const SEGMENT_COLORS = [
@@ -77,12 +83,21 @@ const UserUsageDashboard = () => {
     const [expandedApp, setExpandedApp] = useState(null);
     const [query, setQuery] = useState("");
 
-    const loadUsage = async () => {
+    const loadUsage = async (userIdInput) => {
         setLoading(true);
 
-        try {
-            const accessResult = await hasUsageAccess();
+        // Ensure targetUserId is always a valid string
+        const targetUserId = typeof userIdInput === "string" && userIdInput.trim() !== ""
+            ? userIdInput
+            : auth.currentUser?.uid;
 
+        try {
+            if (!targetUserId) {
+                message.error("Please sign in before loading usage statistics.");
+                return;
+            }
+
+            const accessResult = await hasUsageAccess();
             if (!accessResult.success || !accessResult.hasAccess) {
                 setAccessMissing(true);
                 setUsageData(null);
@@ -101,19 +116,58 @@ const UserUsageDashboard = () => {
 
             setUsageData(result.data);
             setLastUpdated(new Date());
-        } catch {
-            message.error("Couldn't load usage data. Please try again.");
+
+            const registration = await ensureDeviceRegistered(targetUserId);
+
+            if (!registration.success) {
+                console.error("FULL DEVICE REGISTRATION RESULT:", registration);
+                message.error(
+                    `Device registration failed: ${registration.code || "UNKNOWN"} - ${
+                        registration.error || "No error details available"
+                    }`
+                );
+                return;
+            }
+
+            const syncResult = await syncDeviceStatus(
+                registration.deviceId,
+                {
+                    includeUsage: true,
+                }
+            );
+
+            if (syncResult.success) {
+                message.success("All app usage statistics updated in Firebase.");
+            } else {
+                message.warning(
+                    syncResult.error || "Usage loaded, but Firebase sync failed."
+                );
+            }
+        } catch (error) {
+            console.error("USAGE DASHBOARD ERROR:", error);
+            message.error(
+                error?.message || "Couldn't load usage data. Please try again."
+            );
         } finally {
             setLoading(false);
         }
     };
 
     useEffect(() => {
-        loadUsage();
         window.scrollTo({ top: 0 });
+
+        const unsubscribe = onAuthStateChanged(auth, (user) => {
+            if (user) {
+                loadUsage(user.uid);
+            } else {
+                setLoading(false);
+                message.error("Please sign in to view usage statistics.");
+            }
+        });
+
+        return () => unsubscribe();
     }, []);
 
-    // Highest usage first.
     const apps = useMemo(() => {
         return [...(usageData?.apps || [])].sort(
             (a, b) =>
@@ -122,7 +176,6 @@ const UserUsageDashboard = () => {
         );
     }, [usageData]);
 
-    // Prefer the native total; fall back to summing the apps.
     const totalMilliseconds = useMemo(() => {
         const nativeTotal = Number(usageData?.totalScreenTime);
 
@@ -157,7 +210,6 @@ const UserUsageDashboard = () => {
         );
     }, [apps, query]);
 
-    // Stacked share bar: top 5 apps + "Others".
     const segments = useMemo(() => {
         const top = apps.slice(0, 5).map((app, index) => ({
             key: app.packageName || index,
@@ -179,7 +231,6 @@ const UserUsageDashboard = () => {
         }
 
         return top;
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [apps, totalMilliseconds]);
 
     const updatedLabel = lastUpdated
@@ -193,14 +244,12 @@ const UserUsageDashboard = () => {
 
     return (
         <div className="min-h-screen bg-slate-50 pb-24">
-            {/* Header */}
             <header className="sticky top-0 z-40 border-b border-slate-200 bg-white">
                 <div className="mx-auto flex max-w-2xl items-center justify-between px-5 py-4">
                     <div>
                         <p className="text-xs font-medium text-slate-400">
                             SMART SHIELD
                         </p>
-
                         <h1 className="text-xl font-bold text-slate-900">
                             Usage Dashboard
                         </h1>
@@ -210,32 +259,27 @@ const UserUsageDashboard = () => {
                         type="text"
                         aria-label="Refresh usage"
                         icon={<ReloadOutlined />}
-                        onClick={loadUsage}
+                        onClick={() => loadUsage()}
                         loading={loading}
                     />
                 </div>
             </header>
 
             <main className="mx-auto max-w-2xl space-y-5 px-5 py-5">
-                {/* Loading */}
                 {loading && !usageData && (
                     <div className="flex justify-center py-16">
                         <Spin size="large" />
                     </div>
                 )}
 
-                {/* Usage Access */}
                 {accessMissing && !loading && (
                     <section className="rounded-2xl border border-slate-200 bg-white p-6 text-center">
                         <h2 className="font-semibold text-slate-900">
                             Usage Access Required
                         </h2>
-
                         <p className="mt-2 text-sm text-slate-500">
-                            Allow Smart Shield to access application usage
-                            data on your Android device.
+                            Allow Smart Shield to access application usage data on your Android device.
                         </p>
-
                         <Button
                             type="primary"
                             className="mt-5"
@@ -243,8 +287,7 @@ const UserUsageDashboard = () => {
                         >
                             Open Usage Access Settings
                         </Button>
-
-                        <Button block className="mt-3" onClick={loadUsage}>
+                        <Button block className="mt-3" onClick={() => loadUsage()}>
                             I've enabled access
                         </Button>
                     </section>
@@ -252,26 +295,21 @@ const UserUsageDashboard = () => {
 
                 {usageData && (
                     <>
-                        {/* Usage Summary */}
                         <section className="rounded-2xl bg-slate-900 p-6 text-white">
                             <p className="text-sm text-slate-300">
                                 Today's Screen Time
                             </p>
-
                             <div className="mt-2 flex items-center gap-3">
                                 <ClockCircleOutlined className="text-2xl" />
-
                                 <h2 className="text-4xl font-bold">
                                     {formatUsage(totalMilliseconds)}
                                 </h2>
                             </div>
-
                             <p className="mt-3 text-sm text-slate-400">
                                 Total foreground usage detected today
                             </p>
                         </section>
 
-                        {/* Quick Stats */}
                         <section className="grid grid-cols-3 gap-3">
                             <div className="rounded-2xl border border-slate-200 bg-white p-4">
                                 <div className="flex items-center gap-2 text-slate-400">
@@ -280,7 +318,6 @@ const UserUsageDashboard = () => {
                                         Apps Used
                                     </span>
                                 </div>
-
                                 <p className="mt-3 text-2xl font-bold text-slate-900">
                                     {apps.length}
                                 </p>
@@ -290,7 +327,6 @@ const UserUsageDashboard = () => {
                                 <p className="text-xs font-medium text-slate-400">
                                     Top App
                                 </p>
-
                                 <p className="mt-3 truncate text-sm font-semibold text-slate-900">
                                     {mostUsedApp?.appName || "--"}
                                 </p>
@@ -300,20 +336,17 @@ const UserUsageDashboard = () => {
                                 <p className="text-xs font-medium text-slate-400">
                                     Last Updated
                                 </p>
-
                                 <p className="mt-3 text-sm font-semibold text-slate-900">
                                     {updatedLabel}
                                 </p>
                             </div>
                         </section>
 
-                        {/* Time split */}
                         {apps.length > 0 && (
                             <section className="rounded-2xl border border-slate-200 bg-white p-5">
                                 <h2 className="font-semibold text-slate-900">
                                     How your time is split
                                 </h2>
-
                                 <div className="mt-3 flex h-3 overflow-hidden rounded-full bg-slate-100">
                                     {segments.map((segment) => (
                                         <div
@@ -322,11 +355,12 @@ const UserUsageDashboard = () => {
                                             style={{
                                                 width: `${segment.ratio * 100}%`,
                                             }}
-                                            title={`${segment.name} ${formatPercent(segment.ratio)}`}
+                                            title={`${segment.name} ${formatPercent(
+                                                segment.ratio
+                                            )}`}
                                         />
                                     ))}
                                 </div>
-
                                 <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2">
                                     {segments.map((segment) => (
                                         <div
@@ -348,7 +382,6 @@ const UserUsageDashboard = () => {
                             </section>
                         )}
 
-                        {/* App Usage */}
                         <section className="rounded-2xl border border-slate-200 bg-white">
                             <div className="border-b border-slate-100 px-5 py-4">
                                 <div className="flex items-center justify-between gap-3">
@@ -356,17 +389,14 @@ const UserUsageDashboard = () => {
                                         <h2 className="font-semibold text-slate-900">
                                             App Usage
                                         </h2>
-
                                         <p className="mt-1 text-xs text-slate-400">
                                             Highest usage first
                                         </p>
                                     </div>
-
                                     <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
                                         {filteredApps.length} apps
                                     </span>
                                 </div>
-
                                 <Input
                                     allowClear
                                     className="mt-4"
@@ -394,12 +424,14 @@ const UserUsageDashboard = () => {
                                     filteredApps.map((app) => {
                                         const ratio = getRatio(app);
                                         const rank = apps.indexOf(app) + 1;
-                                        const isExpanded =
-                                            expandedApp === app.packageName;
 
                                         return (
                                             <div
-                                                key={app.packageName}
+                                                key={
+                                                    app.packageName ||
+                                                    app.appName ||
+                                                    rank
+                                                }
                                                 className="px-5 py-4"
                                             >
                                                 <button
@@ -407,27 +439,21 @@ const UserUsageDashboard = () => {
                                                     className="flex w-full items-center gap-3 text-left"
                                                     onClick={() =>
                                                         setExpandedApp(
-                                                            isExpanded
+                                                            expandedApp === app.packageName
                                                                 ? null
                                                                 : app.packageName
                                                         )
                                                     }
                                                 >
                                                     <AppIcon app={app} />
-
                                                     <div className="min-w-0 flex-1">
                                                         <p className="truncate text-sm font-semibold text-slate-900">
-                                                            {app.appName ||
-                                                                "Unknown app"}
+                                                            {app.appName || "Unknown app"}
                                                         </p>
-
                                                         <p className="mt-1 text-[11px] text-slate-400">
-                                                            #{rank} ·{" "}
-                                                            {formatPercent(ratio)}{" "}
-                                                            of screen time
+                                                            #{rank} · {formatPercent(ratio)} of screen time
                                                         </p>
                                                     </div>
-
                                                     <div className="shrink-0 text-right">
                                                         <p className="text-sm font-semibold text-slate-900">
                                                             {app.formattedUsage ||
@@ -436,42 +462,19 @@ const UserUsageDashboard = () => {
                                                                 )}
                                                         </p>
                                                     </div>
-
-                                                    {/* <RightOutlined
-                                                        className={`text-xs text-slate-300 transition-transform ${
-                                                            isExpanded
-                                                                ? "rotate-90"
-                                                                : ""
-                                                        }`}
-                                                    /> */}
                                                 </button>
-
                                                 <div className="ml-14 mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100">
                                                     <div
                                                         className="h-full rounded-full bg-slate-800 transition-all"
                                                         style={{
                                                             width: `${
                                                                 ratio > 0
-                                                                    ? Math.max(
-                                                                          ratio * 100,
-                                                                          2
-                                                                      )
+                                                                    ? Math.max(ratio * 100, 2)
                                                                     : 0
                                                             }%`,
                                                         }}
                                                     />
                                                 </div>
-
-                                                {/* {isExpanded && (
-                                                    <div className="ml-14 mt-3 rounded-xl bg-slate-50 p-3">
-                                                        <p className="text-xs font-medium text-slate-500">
-                                                            Package name
-                                                        </p>
-                                                        <p className="mt-1 break-all text-xs text-slate-700">
-                                                            {app.packageName}
-                                                        </p>
-                                                    </div>
-                                                )} */}
                                             </div>
                                         );
                                     })
@@ -482,9 +485,7 @@ const UserUsageDashboard = () => {
                         <div className="flex gap-3 rounded-2xl border border-slate-200 bg-white p-4">
                             <WarningOutlined className="mt-0.5 text-slate-400" />
                             <p className="text-xs leading-5 text-slate-500">
-                                Usage is based on activity data provided by
-                                Android. It may differ from your phone's Digital
-                                Wellbeing total.
+                                Usage is based on activity data provided by Android. It may differ from your phone's Digital Wellbeing total.
                             </p>
                         </div>
                     </>

@@ -10,6 +10,12 @@ import {
     openUsageAccessSettings,
 } from "../../services/usageStatsService";
 
+import {
+    isBatteryUnrestricted,
+    openAutoStartSettings,
+    requestBatteryUnrestricted,
+} from "../../services/backgroundSyncService";
+
 const FocusMode = registerPlugin("FocusMode");
 
 const getPermissionValue = (result, keys) => {
@@ -37,6 +43,7 @@ const UserSecurityPermissions = () => {
     const [overlayGranted, setOverlayGranted] = useState(false);
     const [notificationsGranted, setNotificationsGranted] = useState(false);
     const [accessibilityGranted, setAccessibilityGranted] = useState(false);
+    const [batteryGranted, setBatteryGranted] = useState(false);
 
     const [checking, setChecking] = useState(true);
     const [busy, setBusy] = useState("");
@@ -50,11 +57,13 @@ const UserSecurityPermissions = () => {
                 overlayResult,
                 notificationResult,
                 accessibilityResult,
+                batteryResult,
             ] = await Promise.all([
                 hasUsageAccess(),
                 FocusMode.hasOverlayPermission(),
                 LocalNotifications.checkPermissions(),
                 FocusMode.hasAccessibilityPermission(),
+                isBatteryUnrestricted(),
             ]);
 
             setUsageGranted(
@@ -71,6 +80,10 @@ const UserSecurityPermissions = () => {
 
             setAccessibilityGranted(
                 getPermissionValue(accessibilityResult, ["granted"])
+            );
+
+            setBatteryGranted(
+                getPermissionValue(batteryResult, ["unrestricted"])
             );
 
         } catch (error) {
@@ -183,6 +196,38 @@ const UserSecurityPermissions = () => {
         }
     };
 
+    const requestBattery = async () => {
+        setBusy("battery");
+
+        try {
+            await requestBatteryUnrestricted();
+            message.info(
+                "Choose Allow (or set Battery to Unrestricted), then return."
+            );
+        } catch (error) {
+            console.error(error);
+            message.error("Could not open battery settings.");
+        } finally {
+            setBusy("");
+        }
+    };
+
+    const openAutoStart = async () => {
+        setBusy("autostart");
+
+        try {
+            await openAutoStartSettings();
+            message.info(
+                "Turn ON Auto-start / Background activity for Smart Shield, then return."
+            );
+        } catch (error) {
+            console.error(error);
+            message.error("Could not open auto-start settings.");
+        } finally {
+            setBusy("");
+        }
+    };
+
     const allGranted =
         usageGranted &&
         overlayGranted &&
@@ -241,6 +286,38 @@ const UserSecurityPermissions = () => {
                             onAllow={requestNotifications}
                         />
 
+                        <PermissionRow
+                            title="Run in background (recommended)"
+                            description="Lets Smart Shield stay connected to your admin when the app is closed or the screen is off. Some phones keep showing Not granted even after you allow it, so this does not block Continue."
+                            granted={batteryGranted}
+                            loading={busy === "battery"}
+                            onAllow={requestBattery}
+                        />
+
+                        <div className="rounded-xl border border-slate-200 p-4">
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                                <div className="flex-1">
+                                    <h2 className="font-semibold text-slate-900">
+                                        Auto-start (vivo / OPPO / Xiaomi)
+                                    </h2>
+
+                                    <p className="mt-1 text-sm text-slate-600">
+                                        Some phones also need Auto-start or
+                                        Background activity turned on for Smart
+                                        Shield. Android cannot tell us if this
+                                        is on, so please check it yourself.
+                                    </p>
+                                </div>
+
+                                <Button
+                                    loading={busy === "autostart"}
+                                    onClick={openAutoStart}
+                                >
+                                    Open settings
+                                </Button>
+                            </div>
+                        </div>
+
                     </div>
                 )}
 
@@ -258,6 +335,14 @@ const UserSecurityPermissions = () => {
                         ? "Continue to Dashboard"
                         : "Allow all required permissions"}
                 </Button>
+
+                {allGranted && !batteryGranted && !checking && (
+                    <p className="mt-3 text-center text-xs text-amber-700">
+                        Background running is not confirmed. The app may show
+                        as offline to your admin after it is closed. You can
+                        still continue.
+                    </p>
+                )}
 
                 <Button
                     block
