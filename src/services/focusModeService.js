@@ -1,4 +1,3 @@
-
 import { registerPlugin } from "@capacitor/core";
 
 const FocusMode = registerPlugin("FocusMode");
@@ -33,8 +32,19 @@ export const openAccessibilitySettings = () =>
         "Unable to open accessibility settings."
     );
 
-export const getLaunchableApps = () =>
-    run(() => FocusMode.getLaunchableApps(), "Unable to load installed apps.");
+// Options (all optional):
+//   packages:     only return these package names (small, fast)
+//   includeIcons: false = skip the icon images
+// With no options it returns every launchable app with its icon.
+export const getLaunchableApps = ({ packages, includeIcons } = {}) =>
+    run(
+        () =>
+            FocusMode.getLaunchableApps({
+                ...(Array.isArray(packages) ? { packages } : {}),
+                ...(includeIcons === false ? { includeIcons: false } : {}),
+            }),
+        "Unable to load installed apps."
+    );
 
 // Normal user session. Admin control is deliberately not exposed here.
 export const startFocusSession = ({ packages, durationMs }) =>

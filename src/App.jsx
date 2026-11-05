@@ -9,7 +9,7 @@ import UserFocusDashboard from "./pages/user/UserFocusDashboard";
 import UserProfileDashboard from "./pages/user/UserProfileDashboard";
 import UserSecurityDashboard from "./pages/user/UserSecurityDashboard";
 import UserUsageDashboard from "./pages/user/UserUsageDashboard";
-
+import UserTimeCapsule from "./pages/user/UserTimeCapsule";
 import ProtectedRoute from "./routes/ProtectedRoute";
 import AdminRoute from "./routes/AdminRoute";
 import AdminDashboard from "./pages/admin/AdminDashboard";
@@ -39,6 +39,10 @@ const App = () => {
           <Route
             path="/user/security-permissions"
             element={<UserSecurityPermissions />}
+          />
+          <Route
+            path="/user/time-capsule"
+            element={<UserTimeCapsule />}
           />
           <Route path="/user/dashboard" element={<UserDasahboard />} />
           <Route path="/user/usage" element={<UserUsageDashboard />} />

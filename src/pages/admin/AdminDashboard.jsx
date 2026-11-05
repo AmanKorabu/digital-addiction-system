@@ -28,9 +28,6 @@ import {
   FiWifiOff,
   FiClock,
   FiSearch,
-  FiCheckCircle,
-  FiAlertCircle,
-  FiChevronRight,
   FiMonitor,
 } from "react-icons/fi";
 
@@ -40,7 +37,6 @@ import {
   COMMAND_TYPES,
   ONLINE_WINDOW_MS,
 } from "../../services/deviceControlService";
-import { subscribeToDevicePresence } from "../../services/devicePresenceService";
 
 // -------------------------------------------------------
 // HELPERS
@@ -71,11 +67,6 @@ const formatDate = (value) => {
   const ms = getTimestampMillis(value);
   return ms ? new Date(ms).toLocaleString() : "Not synced yet";
 };
-
-const isPermissionDenied = (error) =>
-  /permission[_ ]denied/i.test(`${error?.code || ""} ${error?.message || ""}`);
-
-const presenceKey = (device) => `${device.userId}_${device.id}`;
 
 const styles = `
 * { box-sizing: border-box; }
@@ -151,7 +142,6 @@ const styles = `
 export default function AdminDashboard() {
   const navigate = useNavigate();
   const [devices, setDevices] = useState([]);
-  const [presenceByDevice, setPresenceByDevice] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -174,23 +164,16 @@ export default function AdminDashboard() {
     return () => clearInterval(timer);
   }, []);
 
-  // Online = live presence OR a recent heartbeat/sync.
+  // Online status based ONLY on Firestore heartbeat (survives app kill)
   const isDeviceOnline = (device) => {
-    const live = Boolean(presenceByDevice[presenceKey(device)]?.connected);
     const lastSync = getTimestampMillis(device.lastSyncAt);
-    return live || (lastSync > 0 && now - lastSync < ONLINE_WINDOW_MS);
+    return lastSync > 0 && now - lastSync < ONLINE_WINDOW_MS;
   };
 
-  // Realtime Firestore devices + RTDB presence listeners.
+  // Realtime Firestore devices listener
   useEffect(() => {
     let unsubscribeDevices = null;
     let authSession = 0;
-    const presenceListeners = new Map();
-
-    const clearPresenceListeners = () => {
-      presenceListeners.forEach((cleanup) => cleanup());
-      presenceListeners.clear();
-    };
 
     const unsubscribeAuth = onAuthStateChanged(auth, (parent) => {
       authSession += 1;
@@ -200,9 +183,6 @@ export default function AdminDashboard() {
         unsubscribeDevices();
         unsubscribeDevices = null;
       }
-      clearPresenceListeners();
-      setDevices([]);
-      setPresenceByDevice({});
 
       if (!parent) {
         setLoading(false);
@@ -227,62 +207,6 @@ export default function AdminDashboard() {
           }));
           setDevices(updatedDevices);
           setLoading(false);
-
-          const activeDevices = updatedDevices
-            .filter((device) => device.userId)
-            .map((device) => ({
-              userId: device.userId,
-              deviceId: device.id,
-              key: presenceKey(device),
-            }));
-          const activeKeys = new Set(activeDevices.map((item) => item.key));
-
-          presenceListeners.forEach((cleanup, key) => {
-            if (!activeKeys.has(key)) {
-              cleanup();
-              presenceListeners.delete(key);
-              setPresenceByDevice((previous) => {
-                const next = { ...previous };
-                delete next[key];
-                return next;
-              });
-            }
-          });
-
-          activeDevices.forEach(({ userId, deviceId, key }) => {
-            if (presenceListeners.has(key)) return;
-            const cleanup = subscribeToDevicePresence(
-              userId,
-              deviceId,
-              (data) => {
-                if (currentSession !== authSession) return;
-                setPresenceByDevice((previous) => ({
-                  ...previous,
-                  [key]: {
-                    connected: Boolean(data?.connected),
-                    lastOnline: Number(data?.lastOnline || 0),
-                    denied: false,
-                  },
-                }));
-              },
-              (presenceError) => {
-                if (currentSession !== authSession) return;
-                presenceListeners.delete(key);
-                setPresenceByDevice((previous) => ({
-                  ...previous,
-                  [key]: {
-                    connected: false,
-                    lastOnline: 0,
-                    denied: isPermissionDenied(presenceError),
-                  },
-                }));
-                if (!isPermissionDenied(presenceError)) {
-                  setError(`Presence error: ${presenceError?.code || presenceError?.message || "Unknown error"}`);
-                }
-              }
-            );
-            presenceListeners.set(key, cleanup);
-          });
         },
         (err) => {
           if (currentSession !== authSession) return;
@@ -297,7 +221,6 @@ export default function AdminDashboard() {
       authSession += 1;
       unsubscribeAuth();
       if (unsubscribeDevices) unsubscribeDevices();
-      clearPresenceListeners();
     };
   }, [navigate, refreshTick]);
 
@@ -336,9 +259,6 @@ export default function AdminDashboard() {
     setError("");
 
     try {
-      // Step 1: Assign the user profile to this parent.
-      // Unassigned user profiles are intentionally not readable by parents,
-      // so try the narrowly permitted parentId update first.
       const userRef = doc(db, "users", uid);
       let userSnapshot;
 
@@ -349,8 +269,6 @@ export default function AdminDashboard() {
         });
         userSnapshot = await getDoc(userRef);
       } catch (assignmentError) {
-        // The update can be denied when this user is already assigned to
-        // this same parent. In that case, the parent is allowed to read it.
         try {
           userSnapshot = await getDoc(userRef);
           if (!userSnapshot.exists()) {
@@ -380,8 +298,6 @@ export default function AdminDashboard() {
         throw new Error("The user profile was not assigned to your admin account.");
       }
 
-      // Step 3: Find an existing device for this user. The rules must allow
-      // the parent to read devices belonging to a user assigned to them.
       const existingDevicesQuery = query(
         collection(db, "devices"),
         where("userId", "==", uid)
@@ -389,7 +305,6 @@ export default function AdminDashboard() {
       const existingDevicesSnapshot = await getDocs(existingDevicesQuery);
 
       if (!existingDevicesSnapshot.empty) {
-        // Link any existing unassigned device document to this parent.
         const unlinkedDevice = existingDevicesSnapshot.docs.find(
           (item) => !item.data().parentId
         );
@@ -408,8 +323,6 @@ export default function AdminDashboard() {
           }
         }
       } else {
-        // Step 4: No device document exists yet. Create an assignment
-        // placeholder. The phone will attach its nativeDeviceId at sign-in.
         await addDoc(collection(db, "devices"), {
           deviceName: name,
           parentId: parent.uid,
@@ -563,12 +476,8 @@ export default function AdminDashboard() {
   };
 
   const renderDeviceCard = (device) => {
-    const presence = presenceByDevice[presenceKey(device)];
     const online = isDeviceOnline(device);
-    const lastSeen = Math.max(
-      getTimestampMillis(device.lastSyncAt),
-      Number(presence?.lastOnline || 0)
-    );
+    const lastSeen = getTimestampMillis(device.lastSyncAt);
     const usage = device.usageSummary || {};
     const apps = Array.isArray(usage.apps)
       ? usage.apps
@@ -607,11 +516,6 @@ export default function AdminDashboard() {
             <FiClock />
             {online ? "Connected to Smart Shield" : lastSeen ? `Last sync: ${new Date(lastSeen).toLocaleString()}` : "No sync recorded yet"}
           </div>
-          {presence?.denied && (
-            <div className="ss-muted" style={{ marginTop: 7, fontSize: 11 }}>
-              Live presence could not be read. Check Realtime Database rules.
-            </div>
-          )}
         </div>
 
         <div className="ss-focus-box">

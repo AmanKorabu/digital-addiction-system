@@ -108,6 +108,18 @@ public class FocusService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // An exception here would crash the app, and START_STICKY would then
+        // restart it again and again. Log it and stop instead.
+        try {
+            return onStartCommandUnsafe(intent, flags, startId);
+        } catch (Throwable error) {
+            Log.e(TAG, "Unexpected error starting focus service", error);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+    }
+
+    private int onStartCommandUnsafe(Intent intent, int flags, int startId) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
 
         boolean active = prefs.getBoolean(KEY_ACTIVE, false);
@@ -169,6 +181,15 @@ public class FocusService extends Service {
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
+            try {
+                tickOnce();
+            } catch (Throwable error) {
+                Log.e(TAG, "Unexpected error in focus loop", error);
+                handler.postDelayed(this, 5000L);
+            }
+        }
+
+        private void tickOnce() {
             long now = System.currentTimeMillis();
 
             if (now >= endTime) {

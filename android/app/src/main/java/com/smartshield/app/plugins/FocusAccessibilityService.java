@@ -148,8 +148,13 @@ public class FocusAccessibilityService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
 
-        handler = new Handler(Looper.getMainLooper());
-        windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+        try {
+            handler = new Handler(Looper.getMainLooper());
+            windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+        } catch (Throwable error) {
+            Log.e(TAG, "Unable to initialise accessibility service", error);
+            return;
+        }
 
         connected = true;
 
@@ -232,6 +237,16 @@ public class FocusAccessibilityService extends AccessibilityService {
      * @param fromWindowState true when eventPackage came from a window-state event
      */
     private void evaluate(String eventPackage, boolean fromWindowState) {
+        // Never let an unexpected error crash the app (the system restarts
+        // accessibility services automatically, which would cause a crash loop).
+        try {
+            evaluateUnsafe(eventPackage, fromWindowState);
+        } catch (Throwable error) {
+            Log.e(TAG, "Unexpected error while evaluating windows", error);
+        }
+    }
+
+    private void evaluateUnsafe(String eventPackage, boolean fromWindowState) {
         SharedPreferences prefs = prefs();
 
         if (!prefs.getBoolean(KEY_ACTIVE, false)) {
@@ -289,8 +304,17 @@ public class FocusAccessibilityService extends AccessibilityService {
     }
 
     /** Looks at the app windows that are currently visible on screen. */
-    @SuppressWarnings("deprecation")
     private Scan scanWindows(Set<String> blocked) {
+        try {
+            return scanWindowsUnsafe(blocked);
+        } catch (Throwable error) {
+            Log.e(TAG, "Unexpected error while scanning windows", error);
+            return new Scan();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private Scan scanWindowsUnsafe(Set<String> blocked) {
         Scan scan = new Scan();
 
         List<AccessibilityWindowInfo> windows;
